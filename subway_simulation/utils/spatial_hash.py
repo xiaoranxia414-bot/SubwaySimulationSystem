@@ -47,3 +47,35 @@ class SpatialHash:
         key = self._get_cell_key(x, y)
         if key in self.grid:
             self.grid[key] = [(e, ex, ey) for e, ex, ey in self.grid[key] if e != entity]
+    
+    def update_position(self, entity, old_x, old_y, new_x, new_y):
+        """更新实体位置
+        
+        Args:
+            entity: 实体
+            old_x, old_y: 旧位置
+            new_x, new_y: 新位置
+        """
+        old_key = self._get_cell_key(old_x, old_y)
+        new_key = self._get_cell_key(new_x, new_y)
+        if old_key != new_key:
+            # 从旧单元格移除
+            if old_key in self.grid:
+                self.grid[old_key] = [(e, ex, ey) for e, ex, ey in self.grid[old_key] if e != entity]
+            # 添加到新单元格
+            if new_key not in self.grid:
+                self.grid[new_key] = []
+            self.grid[new_key].append((entity, new_x, new_y))
+    
+    def adaptive_cell_size(self, entity_count):
+        """自适应调整单元格大小
+        
+        Args:
+            entity_count: 实体数量
+        """
+        if entity_count < 100:
+            self.cell_size = 2.0
+        elif entity_count < 1000:
+            self.cell_size = 1.5
+        else:
+            self.cell_size = 1.0

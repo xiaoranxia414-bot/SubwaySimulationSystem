@@ -1,60 +1,88 @@
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-    QPushButton, QLabel, QLineEdit, QComboBox, QTextEdit, 
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QLineEdit, QComboBox, QTextEdit,
     QTabWidget, QProgressBar, QStatusBar, QFrame, QSplitter,
-    QTableWidget, QTableWidgetItem, QGridLayout, QGraphicsScene, 
+    QTableWidget, QTableWidgetItem, QGridLayout, QGraphicsScene,
     QGraphicsView, QGraphicsEllipseItem, QGraphicsLineItem, QDialog,
-    QFormLayout, QDoubleSpinBox, QSpinBox
+    QFormLayout, QDoubleSpinBox, QSpinBox, QMessageBox, QGraphicsTextItem,
+    QScrollArea
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QPointF
-from PyQt5.QtGui import QFont, QColor, QPainter, QPen, QBrush, QCursor
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QPointF, QRectF
+from PyQt5.QtGui import QFont, QColor, QPainter, QPen, QBrush, QCursor, QIcon
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-# 设置matplotlib中文字体
-plt.rcParams['font.sans-serif'] = ['SimHei']  # 使用黑体
-plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
+
+#自动检测并设置可用中文字体（兼容 Windows / Linux / macOS）（想用来修改节点设置界面的乱码问题，但是好像没起作用）
+import matplotlib.font_manager as _fm
+_CHINESE_FONT_PRIORITY = [
+    'SimHei', 'Microsoft YaHei', 'PingFang SC',       # Windows / macOS
+    'WenQuanYi Zen Hei', 'WenQuanYi Micro Hei',        # Linux
+    'Noto Sans CJK SC', 'Noto Sans SC',                 # Noto 系列
+    'Source Han Sans CN', 'AR PL UMing CN',
+    'DejaVu Sans',                                       # 保底（不显示中文但不乱码）
+]
+_available_fonts = {f.name for f in _fm.fontManager.ttflist}
+_chosen_font = next((f for f in _CHINESE_FONT_PRIORITY if f in _available_fonts), 'DejaVu Sans')
+
+plt.rcParams['font.sans-serif'] = [_chosen_font]
+plt.rcParams['axes.unicode_minus'] = False
+
 import networkx as nx
 import sys
 import time
 from core import StationGraph, SimulationEngine, PathPlanner, AnalyticsModule
 
+
+def _get_qt_chinese_font(size=9) -> "QFont":
+    """返回当前系统上最优的中文字体"""
+    qt_candidates = [
+        'SimHei', 'Microsoft YaHei', 'PingFang SC',
+        'WenQuanYi Zen Hei', 'WenQuanYi Micro Hei',
+        'Noto Sans CJK SC', 'Noto Sans SC',
+    ]
+    from PyQt5.QtGui import QFontDatabase
+    available = set(QFontDatabase().families())
+    for name in qt_candidates:
+        if name in available:
+            return QFont(name, size)
+    return QFont(size)   # 系统默认字体
+
+
+##  仿真线程
+
 class SimulationThread(QThread):
     """仿真线程"""
-    update_signal = pyqtSignal(int, int, dict, float, int)  # 时间步, 乘客数量, 密度数据, 平均密度, 最长队列
+    update_signal = pyqtSignal(int, int, dict, float, int)
     finished_signal = pyqtSignal()
-    
+
     def __init__(self, simulation, steps):
         super().__init__()
         self.simulation = simulation
         self.steps = steps
         self.running = True
         self.paused = False
-    
+
     def run(self):
         for i in range(self.steps):
             if not self.running:
                 break
-            
             while self.paused:
                 time.sleep(0.1)
                 if not self.running:
                     break
-            
             if not self.running:
                 break
-            
-            # 执行仿真步骤
+
             self.simulation.run_simulation_step()
-            
-            # 每10步发送更新信号
+
             if (i + 1) % 10 == 0:
                 passenger_count = len(self.simulation.simulation.get_passengers())
                 densities = {}
                 total_density = 0
                 node_count = 0
                 max_queue = 0
-                
+
                 for node in self.simulation.station_graph.get_graph().nodes():
                     node_info = self.simulation.station_graph.get_node(node)
                     if node_info:
@@ -62,1465 +90,1442 @@ class SimulationThread(QThread):
                         densities[node] = density
                         total_density += density
                         node_count += 1
-                
-                # 计算平均密度
+
                 avg_density = total_density / node_count if node_count > 0 else 0
-                
-                # 获取最长队列
+
                 for node_id, queue in self.simulation.simulation.queues.items():
                     queue_length = len(queue)
                     if queue_length > max_queue:
                         max_queue = queue_length
-                
-                # 确保至少有一个队列被检查
-                if not self.simulation.simulation.queues:
-                    # 如果没有队列，设置为0
-                    max_queue = 0
-                
+
                 self.update_signal.emit(i + 1, passenger_count, densities, avg_density, max_queue)
-            
-            # 暂停一下，避免UI卡顿
+
             time.sleep(0.1)
-        
+
         self.finished_signal.emit()
-    
+
     def pause(self):
         self.paused = True
-    
+
     def resume(self):
         self.paused = False
-    
+
     def stop(self):
         self.running = False
         self.paused = False
 
-class TopologyView(QWidget):
-    """拓扑图视图"""
-    
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.layout = QVBoxLayout(self)
-        
-        # 工具栏
-        self.toolbar = QHBoxLayout()
-        self.add_node_button = QPushButton("添加节点")
-        self.add_edge_button = QPushButton("添加边")
-        self.delete_button = QPushButton("删除")
-        self.toolbar.addWidget(self.add_node_button)
-        self.toolbar.addWidget(self.add_edge_button)
-        self.toolbar.addWidget(self.delete_button)
-        self.layout.addLayout(self.toolbar)
-        
-        # 图形场景和视图
-        self.scene = QGraphicsScene()
-        self.view = QGraphicsView(self.scene)
-        self.view.setSceneRect(0, 0, 800, 600)
-        self.view.setDragMode(QGraphicsView.RubberBandDrag)
-        self.layout.addWidget(self.view)
-        
-        # 状态
-        self.add_edge_mode = False
-        self.start_node = None
-        self.temp_edge = None
-        
-        # 节点和边的映射
-        self.node_items = {}
-        self.edge_items = {}
-        
-        # 信号连接
-        self.add_node_button.clicked.connect(self.add_node)
-        self.add_edge_button.clicked.connect(self.toggle_add_edge_mode)
-        self.delete_button.clicked.connect(self.delete_selected)
-        self.view.mousePressEvent = self.mouse_press_event
-        self.view.mouseMoveEvent = self.mouse_move_event
-        self.view.mouseReleaseEvent = self.mouse_release_event
-        self.view.mouseDoubleClickEvent = self.mouse_double_click_event
-        
-        # 加载默认拓扑图
-        self._load_default_topology()
-    
-    def add_node(self):
-        """添加节点"""
-        dialog = NodeDialog(self)
-        if dialog.exec_() == QDialog.Accepted:
-            data = dialog.get_data()
-            node_id = data['id']
-            if node_id:
-                # 在鼠标位置创建节点
-                pos = self.view.mapToScene(QCursor.pos() - self.view.mapToGlobal(self.view.pos()))
-                node_item = NodeItem(node_id, data['type'], pos.x(), pos.y())
-                self.scene.addItem(node_item)
-                self.node_items[node_id] = node_item
-    
-    def toggle_add_edge_mode(self):
-        """切换添加边模式"""
-        self.add_edge_mode = not self.add_edge_mode
-        self.add_edge_button.setText("取消添加边" if self.add_edge_mode else "添加边")
-        self.start_node = None
-        if self.temp_edge:
-            self.scene.removeItem(self.temp_edge)
-            self.temp_edge = None
-    
-    def delete_selected(self):
-        """删除选中的项"""
-        for item in self.scene.selectedItems():
-            if isinstance(item, NodeItem):
-                # 删除相关的边
-                edges_to_remove = []
-                for (from_node, to_node), edge_item in self.edge_items.items():
-                    if edge_item.from_node == item or edge_item.to_node == item:
-                        edges_to_remove.append((from_node, to_node))
-                
-                for edge_key in edges_to_remove:
-                    if edge_key in self.edge_items:
-                        self.scene.removeItem(self.edge_items[edge_key])
-                        del self.edge_items[edge_key]
-                
-                # 删除节点
-                del self.node_items[item.node_id]
-                self.scene.removeItem(item)
-            elif isinstance(item, EdgeItem):
-                # 删除边
-                for (from_node, to_node), edge_item in self.edge_items.items():
-                    if edge_item == item:
-                        del self.edge_items[(from_node, to_node)]
-                        break
-                self.scene.removeItem(item)
-    
-    def mouse_press_event(self, event):
-        """鼠标按下事件"""
-        if self.add_edge_mode:
-            pos = event.pos()
-            item = self.view.itemAt(pos)
-            if isinstance(item, NodeItem):
-                if not self.start_node:
-                    # 选择起点
-                    self.start_node = item
-                else:
-                    # 选择终点
-                    if self.start_node != item:
-                        # 创建边
-                        edge_key = (self.start_node.node_id, item.node_id)
-                        if edge_key not in self.edge_items:
-                            edge_item = EdgeItem(self.start_node, item)
-                            self.scene.addItem(edge_item)
-                            self.edge_items[edge_key] = edge_item
-                    # 重置
-                    self.start_node = None
-        else:
-            # 调用默认的鼠标事件处理
-            QGraphicsView.mousePressEvent(self.view, event)
-    
-    def mouse_move_event(self, event):
-        """鼠标移动事件"""
-        if self.add_edge_mode and self.start_node:
-            # 绘制临时边
-            pos = self.view.mapToScene(event.pos())
-            if self.temp_edge:
-                self.scene.removeItem(self.temp_edge)
-            self.temp_edge = QGraphicsLineItem(self.start_node.x(), self.start_node.y(), pos.x(), pos.y())
-            self.temp_edge.setPen(QPen(QColor('gray'), 2, Qt.DashLine))
-            self.scene.addItem(self.temp_edge)
-        else:
-            # 调用默认的鼠标事件处理
-            QGraphicsView.mouseMoveEvent(self.view, event)
-    
-    def mouse_release_event(self, event):
-        """鼠标释放事件"""
-        if self.add_edge_mode and self.temp_edge:
-            self.scene.removeItem(self.temp_edge)
-            self.temp_edge = None
-        # 调用默认的鼠标事件处理
-        QGraphicsView.mouseReleaseEvent(self.view, event)
-    
-    def mouse_double_click_event(self, event):
-        """鼠标双击事件"""
-        pos = event.pos()
-        item = self.view.itemAt(pos)
-        
-        if isinstance(item, NodeItem):
-            # 双击编辑节点属性
-            node_data = {
-                'id': item.node_id,
-                'type': item.node_type,
-                'capacity': 50,  # 默认值
-                'area': 100.0,  # 默认值
-                'base_speed': 1.0  # 默认值
-            }
-            dialog = NodeDialog(self, node_data)
-            if dialog.exec_() == QDialog.Accepted:
-                new_data = dialog.get_data()
-                new_node_id = new_data['id']
-                
-                if new_node_id and new_node_id != item.node_id:
-                    # 更新节点ID
-                    del self.node_items[item.node_id]
-                    item.node_id = new_node_id
-                    self.node_items[new_node_id] = item
-                
-                # 更新节点类型
-                if new_data['type'] != item.node_type:
-                    item.node_type = new_data['type']
-                    item.setBrush(item._get_brush())
-        else:
-            # 双击添加节点
-            dialog = NodeDialog(self)
-            if dialog.exec_() == QDialog.Accepted:
-                data = dialog.get_data()
-                node_id = data['id']
-                if node_id:
-                    # 在双击位置创建节点
-                    scene_pos = self.view.mapToScene(pos)
-                    node_item = NodeItem(node_id, data['type'], scene_pos.x(), scene_pos.y())
-                    self.scene.addItem(node_item)
-                    self.node_items[node_id] = node_item
-    
-    def update_view(self, graph, passengers):
-        """更新拓扑图"""
-        # 清空场景
-        self.scene.clear()
-        self.node_items.clear()
-        self.edge_items.clear()
-        
-        # 添加节点
-        pos = {}
-        for node, data in graph.nodes(data=True):
-            pos[node] = (data['x'], data['y'])
-            node_item = NodeItem(node, data['type'], data['x'], data['y'])
-            self.scene.addItem(node_item)
-            self.node_items[node] = node_item
-        
-        # 添加边
-        for u, v, data in graph.edges(data=True):
-            if u in self.node_items and v in self.node_items:
-                edge_item = EdgeItem(self.node_items[u], self.node_items[v])
-                self.scene.addItem(edge_item)
-                self.edge_items[(u, v)] = edge_item
-        
-        # 统计每个节点的乘客数量
-        node_passenger_counts = {}
-        for passenger in passengers:
-            node_id = passenger.current_node
-            if node_id not in node_passenger_counts:
-                node_passenger_counts[node_id] = 0
-            node_passenger_counts[node_id] += 1
-        
-        # 更新节点标签
-        for node, item in self.node_items.items():
-            count = node_passenger_counts.get(node, 0)
-            # 更新乘客数量标签
-            item.update_passenger_count(count)
-    
-    def reset(self):
-        """重置视图"""
-        self.scene.clear()
-        self.node_items.clear()
-        self.edge_items.clear()
-        # 重新加载默认拓扑图
-        self._load_default_topology()
-    
-    def get_graph(self):
-        """获取图结构"""
-        graph = StationGraph()
-        
-        # 添加节点
-        for node_id, item in self.node_items.items():
-            graph.add_node(
-                node_id,
-                item.node_type,
-                50,  # 默认容量
-                item.x(),
-                item.y(),
-                area=100.0,
-                base_speed=1.0
-            )
-        
-        # 添加边
-        for (from_node, to_node), item in self.edge_items.items():
-            # 计算距离
-            distance = ((item.from_node.x() - item.to_node.x()) ** 2 + 
-                       (item.from_node.y() - item.to_node.y()) ** 2) ** 0.5
-            graph.add_edge(from_node, to_node, distance, 2)
-        
-        return graph
-    
-    def update_congestion(self, congestion_data):
-        """更新拥堵状态"""
-        for node_id, congestion in congestion_data.items():
-            if node_id in self.node_items:
-                self.node_items[node_id].update_congestion(congestion)
-        
-        for (from_node, to_node), edge_item in self.edge_items.items():
-            # 暂时使用默认值
-            edge_item.update_congestion(1.0)
-    
-    def _load_default_topology(self):
-        """加载默认拓扑图"""
-        # 创建默认的中型站拓扑
-        node_count = 2
-        
-        # 添加入口节点
-        for i in range(1, node_count + 1):
-            node_id = f'entrance{i}'
-            node_item = NodeItem(node_id, 'entrance', 0, 5 * i)
-            self.scene.addItem(node_item)
-            self.node_items[node_id] = node_item
-        
-        # 添加售票区节点
-        for i in range(1, node_count + 1):
-            node_id = f'ticket{i}'
-            node_item = NodeItem(node_id, 'ticket', 5, 5 * i)
-            self.scene.addItem(node_item)
-            self.node_items[node_id] = node_item
-        
-        # 添加安检区节点
-        for i in range(1, node_count + 1):
-            node_id = f'security{i}'
-            node_item = NodeItem(node_id, 'security', 10, 5 * i)
-            self.scene.addItem(node_item)
-            self.node_items[node_id] = node_item
-        
-        # 添加闸机区节点
-        for i in range(1, node_count + 1):
-            node_id = f'gate{i}'
-            node_item = NodeItem(node_id, 'gate', 15, 5 * i)
-            self.scene.addItem(node_item)
-            self.node_items[node_id] = node_item
-        
-        # 添加通道节点
-        node_id = 'corridor1'
-        node_item = NodeItem(node_id, 'corridor', 20, 10)
-        self.scene.addItem(node_item)
-        self.node_items[node_id] = node_item
-        
-        # 添加楼梯节点
-        for i in range(1, node_count + 1):
-            node_id = f'stairs{i}'
-            node_item = NodeItem(node_id, 'stairs', 25, 5 * i)
-            self.scene.addItem(node_item)
-            self.node_items[node_id] = node_item
-        
-        # 添加扶梯节点
-        for i in range(1, node_count + 1):
-            node_id = f'escalator{i}'
-            node_item = NodeItem(node_id, 'escalator', 25, 5 * i + 2.5)
-            self.scene.addItem(node_item)
-            self.node_items[node_id] = node_item
-        
-        # 添加站台节点
-        for i in range(1, node_count + 1):
-            node_id = f'platform{i}'
-            node_item = NodeItem(node_id, 'platform', 30, 5 * i)
-            self.scene.addItem(node_item)
-            self.node_items[node_id] = node_item
-        
-        # 添加出口节点
-        for i in range(1, node_count + 1):
-            node_id = f'exit{i}'
-            node_item = NodeItem(node_id, 'exit', 35, 5 * i)
-            self.scene.addItem(node_item)
-            self.node_items[node_id] = node_item
-        
-        # 添加边
-        # 入口到售票区
-        for i in range(1, node_count + 1):
-            from_node = f'entrance{i}'
-            to_node = f'ticket{i}'
-            if from_node in self.node_items and to_node in self.node_items:
-                edge_item = EdgeItem(self.node_items[from_node], self.node_items[to_node])
-                self.scene.addItem(edge_item)
-                self.edge_items[(from_node, to_node)] = edge_item
-        
-        # 售票区到安检区
-        for i in range(1, node_count + 1):
-            from_node = f'ticket{i}'
-            to_node = f'security{i}'
-            if from_node in self.node_items and to_node in self.node_items:
-                edge_item = EdgeItem(self.node_items[from_node], self.node_items[to_node])
-                self.scene.addItem(edge_item)
-                self.edge_items[(from_node, to_node)] = edge_item
-        
-        # 安检区到闸机区
-        for i in range(1, node_count + 1):
-            from_node = f'security{i}'
-            to_node = f'gate{i}'
-            if from_node in self.node_items and to_node in self.node_items:
-                edge_item = EdgeItem(self.node_items[from_node], self.node_items[to_node])
-                self.scene.addItem(edge_item)
-                self.edge_items[(from_node, to_node)] = edge_item
-        
-        # 闸机区到通道
-        for i in range(1, node_count + 1):
-            from_node = f'gate{i}'
-            to_node = 'corridor1'
-            if from_node in self.node_items and to_node in self.node_items:
-                edge_item = EdgeItem(self.node_items[from_node], self.node_items[to_node])
-                self.scene.addItem(edge_item)
-                self.edge_items[(from_node, to_node)] = edge_item
-        
-        # 通道到楼梯/扶梯
-        for i in range(1, node_count + 1):
-            from_node = 'corridor1'
-            to_node = f'stairs{i}'
-            if from_node in self.node_items and to_node in self.node_items:
-                edge_item = EdgeItem(self.node_items[from_node], self.node_items[to_node])
-                self.scene.addItem(edge_item)
-                self.edge_items[(from_node, to_node)] = edge_item
-            
-            from_node = 'corridor1'
-            to_node = f'escalator{i}'
-            if from_node in self.node_items and to_node in self.node_items:
-                edge_item = EdgeItem(self.node_items[from_node], self.node_items[to_node])
-                self.scene.addItem(edge_item)
-                self.edge_items[(from_node, to_node)] = edge_item
-        
-        # 楼梯/扶梯到站台
-        for i in range(1, node_count + 1):
-            from_node = f'stairs{i}'
-            to_node = f'platform{i}'
-            if from_node in self.node_items and to_node in self.node_items:
-                edge_item = EdgeItem(self.node_items[from_node], self.node_items[to_node])
-                self.scene.addItem(edge_item)
-                self.edge_items[(from_node, to_node)] = edge_item
-            
-            from_node = f'escalator{i}'
-            to_node = f'platform{i}'
-            if from_node in self.node_items and to_node in self.node_items:
-                edge_item = EdgeItem(self.node_items[from_node], self.node_items[to_node])
-                self.scene.addItem(edge_item)
-                self.edge_items[(from_node, to_node)] = edge_item
-        
-        # 站台到出口
-        for i in range(1, node_count + 1):
-            from_node = f'platform{i}'
-            to_node = f'exit{i}'
-            if from_node in self.node_items and to_node in self.node_items:
-                edge_item = EdgeItem(self.node_items[from_node], self.node_items[to_node])
-                self.scene.addItem(edge_item)
-                self.edge_items[(from_node, to_node)] = edge_item
 
-class NodeDialog(QDialog):
-    """节点属性对话框"""
-    
-    def __init__(self, parent=None, node_data=None):
-        super().__init__(parent)
-        self.setWindowTitle("节点属性")
-        self.setGeometry(200, 200, 300, 300)
-        
-        self.layout = QFormLayout(self)
-        
-        # 节点ID
-        self.id_edit = QLineEdit()
-        self.layout.addRow("节点ID:", self.id_edit)
-        
-        # 节点类型
-        self.type_combo = QComboBox()
-        self.type_combo.addItems(['entrance', 'exit', 'security', 'ticket', 'gate', 'platform', 'corridor', 'stairs', 'escalator'])
-        self.layout.addRow("节点类型:", self.type_combo)
-        
-        # 容量
-        self.capacity_spin = QSpinBox()
-        self.capacity_spin.setRange(1, 1000)
-        self.capacity_spin.setValue(50)
-        self.layout.addRow("容量:", self.capacity_spin)
-        
-        # 面积
-        self.area_spin = QDoubleSpinBox()
-        self.area_spin.setRange(10.0, 1000.0)
-        self.area_spin.setValue(100.0)
-        self.layout.addRow("面积:", self.area_spin)
-        
-        # 基础速度
-        self.base_speed_spin = QDoubleSpinBox()
-        self.base_speed_spin.setRange(0.1, 2.0)
-        self.base_speed_spin.setValue(1.0)
-        self.layout.addRow("基础速度:", self.base_speed_spin)
-        
-        # 按钮
-        self.button_layout = QHBoxLayout()
-        self.ok_button = QPushButton("确定")
-        self.cancel_button = QPushButton("取消")
-        self.button_layout.addWidget(self.ok_button)
-        self.button_layout.addWidget(self.cancel_button)
-        self.layout.addRow(self.button_layout)
-        
-        # 信号连接
-        self.ok_button.clicked.connect(self.accept)
-        self.cancel_button.clicked.connect(self.reject)
-        
-        # 填充数据
-        if node_data:
-            self.id_edit.setText(node_data.get('id', ''))
-            # 直接设置节点类型，不进行条件判断
-            self.type_combo.setCurrentText(node_data.get('type', 'entrance'))
-            self.capacity_spin.setValue(node_data.get('capacity', 50))
-            self.area_spin.setValue(node_data.get('area', 100.0))
-            self.base_speed_spin.setValue(node_data.get('base_speed', 1.0))
-    
-    def get_data(self):
-        """获取节点数据"""
-        return {
-            'id': self.id_edit.text(),
-            'type': self.type_combo.currentText(),
-            'capacity': self.capacity_spin.value(),
-            'area': self.area_spin.value(),
-            'base_speed': self.base_speed_spin.value()
-        }
-
-from PyQt5.QtWidgets import QGraphicsTextItem
+##  节点图形项
 
 class NodeItem(QGraphicsEllipseItem):
-    """节点图形项"""
-    
-    def __init__(self, node_id, node_type, x, y, parent=None):
-        super().__init__(-10, -10, 20, 20, parent)
-        self.node_id = node_id
-        self.node_type = node_type
+    """节点图形项（支持拖拽时连线跟随）"""
+
+    NODE_RADIUS = 12  # 节点半径，统一管理
+
+    def __init__(self, node_id, node_type, x, y,
+                 capacity=50, area=100.0, base_speed=1.0, parent=None):
+        r = NodeItem.NODE_RADIUS
+        super().__init__(-r, -r, r * 2, r * 2, parent)
+        self.node_id    = node_id
+        self.node_type  = node_type
+        # 储完整属性，get_graph() 导出时使用
+        self.capacity   = capacity
+        self.area       = area
+        self.base_speed = base_speed
         self.setPos(x, y)
         self.setBrush(self._get_brush())
         self.setPen(QPen(QColor('black'), 2))
-        self.setFlag(QGraphicsEllipseItem.ItemIsMovable)
-        self.setFlag(QGraphicsEllipseItem.ItemIsSelectable)
-        
-        # 添加节点ID标签
+
+        # 关键：开启位置变化通知，itemChange 才会触发
+        self.setFlag(QGraphicsEllipseItem.ItemIsMovable, True)
+        self.setFlag(QGraphicsEllipseItem.ItemIsSelectable, True)
+        self.setFlag(QGraphicsEllipseItem.ItemSendsGeometryChanges, True)
+
+        # 节点ID标签
         self.id_text = QGraphicsTextItem(node_id, self)
-        self.id_text.setPos(-15, -30)
+        self.id_text.setPos(-r, -r - 18)
         self.id_text.setDefaultTextColor(QColor('black'))
-        
-        # 添加人数标签
+
+        # 人数标签
         self.count_text = QGraphicsTextItem("0人", self)
-        self.count_text.setPos(-10, 15)
-        self.count_text.setDefaultTextColor(QColor('black'))
-    
+        self.count_text.setPos(-r, r + 2)
+        self.count_text.setDefaultTextColor(QColor('#333333'))
+
+        # 拥堵高亮边框
+        self._base_pen = QPen(QColor('black'), 2)
+        self._congestion_pen = QPen(QColor('red'), 3)
+
+    # 颜色
+    _COLOR_MAP = {
+        'entrance':  '#27ae60',
+        'exit':      '#e74c3c',
+        'security':  '#f39c12',
+        'ticket':    '#2980b9',
+        'gate':      '#e67e22',
+        'platform':  '#8e44ad',
+        'corridor':  '#7f8c8d',
+        'stairs':    '#795548',
+        'escalator': '#f48fb1',
+    }
+
     def _get_brush(self):
-        """根据节点类型获取颜色"""
-        color_map = {
-            'entrance': QColor('green'),
-            'exit': QColor('red'),
-            'security': QColor('yellow'),
-            'ticket': QColor('blue'),
-            'gate': QColor('orange'),
-            'platform': QColor('purple'),
-            'corridor': QColor('gray'),
-            'stairs': QColor('brown'),
-            'escalator': QColor('pink')
-        }
-        return QBrush(color_map.get(self.node_type, QColor('white')))
-    
+        color = self._COLOR_MAP.get(self.node_type, '#ffffff')
+        return QBrush(QColor(color))
+
+    #拥堵渐变
     def update_congestion(self, congestion):
-        """根据拥堵程度更新颜色"""
-        base_brush = self._get_brush()
-        base_color = base_brush.color()
-        # 向红色渐变
-        red_component = min(255, base_color.red() + int(congestion * 50))
-        green_component = max(0, base_color.green() - int(congestion * 50))
-        blue_component = max(0, base_color.blue() - int(congestion * 50))
-        new_color = QColor(red_component, green_component, blue_component)
-        self.setBrush(QBrush(new_color))
-    
+        """congestion: 0~1 浮点，越大越红"""
+        base = QColor(self._COLOR_MAP.get(self.node_type, '#ffffff'))
+        r = min(255, base.red()   + int(congestion * 80))
+        g = max(0,   base.green() - int(congestion * 80))
+        b = max(0,   base.blue()  - int(congestion * 80))
+        self.setBrush(QBrush(QColor(r, g, b)))
+        if congestion > 0.6:
+            self.setPen(self._congestion_pen)
+        else:
+            self.setPen(self._base_pen)
+
+    # 乘客人数
     def update_passenger_count(self, count):
-        """更新乘客数量标签"""
-        self.count_text.setText(f"{count}人")
-    
+        self.count_text.setPlainText(f"{count}人")
+
+    # 拖拽时连线跟随的核心逻辑
     def itemChange(self, change, value):
-        """处理项目变化"""
-        if change == QGraphicsEllipseItem.ItemPositionChange:
-            # 当节点位置变化时，更新相关的边
-            for edge in self.scene().items():
-                if isinstance(edge, EdgeItem):
-                    if edge.from_node == self or edge.to_node == self:
-                        edge.update_position()
-        return super().itemChange(change, value)
+        # 先调用 super() 让位置真正更新，再通知关联的边
+        result = super().itemChange(change, value)
+        if change == QGraphicsEllipseItem.ItemPositionHasChanged:
+            if self.scene():
+                for item in self.scene().items():
+                    if isinstance(item, EdgeItem):
+                        if item.from_node is self or item.to_node is self:
+                            item.update_position()
+        return result
+
+
+##  边图形项
 
 class EdgeItem(QGraphicsLineItem):
-    """边图形项"""
-    
+    """边图形项（支持动态更新位置）"""
+
     def __init__(self, from_node, to_node, parent=None):
         super().__init__(parent)
         self.from_node = from_node
         self.to_node = to_node
+        self._default_pen = QPen(QColor('#2c3e50'), 4)
+        self.setPen(self._default_pen)
+        # 开启可选中，才能被 scene.selectedItems() 捕获到
+        self.setFlag(QGraphicsLineItem.ItemIsSelectable, True)
+        # 确保边始终在节点下方渲染
+        self.setZValue(-1)
         self.update_position()
-        self.setPen(QPen(QColor('black'), 2))
-    
-    def update_position(self):
-        """更新边的位置"""
-        if self.from_node and self.to_node:
-            self.setLine(self.from_node.x(), self.from_node.y(), self.to_node.x(), self.to_node.y())
-    
-    def update_congestion(self, congestion_factor):
-        """根据拥堵系数更新颜色和粗细"""
-        # 计算粗细
-        width = max(2, min(8, 2 + congestion_factor * 2))
-        # 计算颜色（向红色渐变）
-        red = min(255, int(congestion_factor * 50))
-        color = QColor(red, 0, 0)
-        self.setPen(QPen(color, width))
 
-class TopologyEditView(QWidget):
-    """拓扑编辑视图"""
-    
+    def itemChange(self, change, value):
+        if change == QGraphicsLineItem.ItemSelectedHasChanged:
+            if value:
+                self.setPen(QPen(QColor('#e74c3c'), 4))   # 选中：红色，粗细相同
+            else:
+                self.setPen(self._default_pen)             # 取消：恢复默认
+        return super().itemChange(change, value)
+
+    def update_position(self):
+        """用 scenePos() 获取全局坐标，避免父子坐标系混淆"""
+        if self.from_node and self.to_node:
+            fp = self.from_node.scenePos()
+            tp = self.to_node.scenePos()
+            self.setLine(fp.x(), fp.y(), tp.x(), tp.y())
+
+    def update_congestion(self, congestion_factor):
+        """根据拥堵系数更新线条颜色和粗细"""
+        width = max(2, min(8, int(congestion_factor * 2)))
+        ratio = min(1.0, (congestion_factor - 1.0) / 2.0)
+        r = int(44  + ratio * (231 - 44))
+        g = int(62  + ratio * (76  - 62))
+        b = int(80  - ratio * 80)
+        self.setPen(QPen(QColor(r, g, b), width))
+
+
+##  节点属性对话框
+
+class NodeDialog(QDialog):
+    """节点属性弹窗"""
+
+    NODE_TYPES = ['entrance', 'exit', 'security', 'ticket',
+                  'gate', 'platform', 'corridor', 'stairs', 'escalator']
+
+    def __init__(self, parent=None, node_data=None, existing_ids=None):
+        """
+        Args:
+            existing_ids: 已存在的节点ID集合，用于重名校验
+        """
+        super().__init__(parent)
+        self.existing_ids = existing_ids or set()
+        self._original_id = node_data.get('id', '') if node_data else ''
+        self.setWindowTitle("节点属性")
+        self.setFixedSize(340, 295)
+
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+
+        # 这里是想解决Windows 上 QSpinBox/QDoubleSpinBox 数字乱码问题：
+        #    对话框里所有控件单独设置一个保证包含数字字形的字体。
+        _num_font  = QFont("Arial", 10)          # 数字控件用 Arial
+        _text_font = _get_qt_chinese_font(10)    # 文字控件用中文字体
+
+        layout = QFormLayout(self)
+        layout.setLabelAlignment(Qt.AlignRight)
+        layout.setSpacing(10)
+
+        # 节点ID
+        self.id_edit = QLineEdit()
+        self.id_edit.setFont(_text_font)
+        #self.id_edit.setPlaceholderText("例如: entrance3")
+        layout.addRow("节点 ID:", self.id_edit)
+
+        # 节点类型
+        self.type_combo = QComboBox()
+        self.type_combo.setFont(_text_font)
+        self.type_combo.addItems(self.NODE_TYPES)
+        layout.addRow("节点类型:", self.type_combo)
+
+        # 容量
+        self.capacity_spin = QSpinBox()
+        self.capacity_spin.setFont(_num_font)
+        self.capacity_spin.setRange(1, 1000)
+        self.capacity_spin.setValue(50)
+        layout.addRow("容量 (人):", self.capacity_spin)
+
+        # 面积
+        self.area_spin = QDoubleSpinBox()
+        self.area_spin.setFont(_num_font)
+        self.area_spin.setRange(10.0, 10000.0)
+        self.area_spin.setDecimals(1)
+        self.area_spin.setSingleStep(10.0)
+        self.area_spin.setValue(100.0)
+        layout.addRow("面积 (m2):", self.area_spin)
+
+        # 基础速度
+        self.speed_spin = QDoubleSpinBox()
+        self.speed_spin.setFont(_num_font)
+        self.speed_spin.setRange(0.1, 3.0)
+        self.speed_spin.setDecimals(2)
+        self.speed_spin.setSingleStep(0.1)
+        self.speed_spin.setValue(1.0)
+        layout.addRow("速度 (m/s):", self.speed_spin)
+
+        # 按钮
+        btn_layout = QHBoxLayout()
+        self.ok_btn = QPushButton("确定")
+        self.ok_btn.setFont(_text_font)
+        self.ok_btn.setMinimumHeight(30)
+        self.cancel_btn = QPushButton("取消")
+        self.cancel_btn.setFont(_text_font)
+        self.cancel_btn.setMinimumHeight(30)
+        btn_layout.addWidget(self.ok_btn)
+        btn_layout.addWidget(self.cancel_btn)
+        layout.addRow(btn_layout)
+
+        self.ok_btn.clicked.connect(self._on_accept)
+        self.cancel_btn.clicked.connect(self.reject)
+
+        # 填充已有数据
+        if node_data:
+            self.id_edit.setText(node_data.get('id', ''))
+            self.type_combo.setCurrentText(node_data.get('type', 'entrance'))
+            self.capacity_spin.setValue(node_data.get('capacity', 50))
+            self.area_spin.setValue(node_data.get('area', 100.0))
+            self.speed_spin.setValue(node_data.get('base_speed', 1.0))
+
+    def _on_accept(self):
+        """校验后接受"""
+        node_id = self.id_edit.text().strip()
+        if not node_id:
+            QMessageBox.warning(self, "输入错误", "节点 ID 不能为空！")
+            return
+        # 仅在新建或修改了ID时检查重名
+        if node_id != self._original_id and node_id in self.existing_ids:
+            QMessageBox.warning(self, "输入错误", f"节点 ID「{node_id}」已存在，请换一个名称！")
+            return
+        self.accept()
+
+    def get_data(self):
+        return {
+            'id':         self.id_edit.text().strip(),
+            'type':       self.type_combo.currentText(),
+            'capacity':   self.capacity_spin.value(),
+            'area':       self.area_spin.value(),
+            'base_speed': self.speed_spin.value(),
+        }
+
+
+
+###  拓扑图视图（主视图，含编辑功能）
+
+##  时段流量配置对话框
+
+class PeriodConfigDialog(QDialog):
+    _LEVEL_MAP = {'高峰期': 'peak', '平常期': 'normal', '低谷期': 'trough'}
+
+    def __init__(self, rules=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("配置时段流量")
+        self.setMinimumWidth(420)
+        layout = QVBoxLayout(self)
+
+        hint = QLabel(
+            "为每个时段设置流量等级：\n"
+            "  高峰期 — 时段中点流量升至基础的 4 倍\n"
+            "  低谷期 — 时段中点流量降至基础的 0.2 倍\n"
+            "  平常期 — 流量保持基础值不变\n"
+            "未配置的时间段自动按平常期处理。"
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        self._rows_widget = QWidget()
+        self._rows_layout = QVBoxLayout(self._rows_widget)
+        self._rows_layout.setSpacing(4)
+        scroll.setWidget(self._rows_widget)
+        layout.addWidget(scroll)
+
+        add_btn = QPushButton("＋ 添加时段")
+        add_btn.clicked.connect(self._add_row)
+        layout.addWidget(add_btn)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+        self._row_widgets = []
+        if rules:
+            for r in rules:
+                self._add_row(r)
+        else:
+            self._add_row()
+
+    def _add_row(self, rule=None):
+        row_w = QWidget()
+        row_l = QHBoxLayout(row_w)
+        row_l.setContentsMargins(0, 0, 0, 0)
+        hours = [f"{h:02d}:00" for h in range(6, 25)]
+        start_c = QComboBox(); start_c.addItems(hours)
+        end_c   = QComboBox(); end_c.addItems(hours)
+        level_c = QComboBox(); level_c.addItems(["高峰期", "平常期", "低谷期"])
+        del_btn = QPushButton("✕")
+        del_btn.setFixedWidth(28)
+
+        if rule:
+            start_c.setCurrentIndex(max(0, rule['start'] - 6))
+            end_c.setCurrentIndex(max(0, rule['end'] - 6))
+            lvl_inv = {v: k for k, v in self._LEVEL_MAP.items()}
+            level_c.setCurrentText(lvl_inv.get(rule['level'], '平常期'))
+
+        row_l.addWidget(QLabel("起:"))
+        row_l.addWidget(start_c)
+        row_l.addWidget(QLabel("止:"))
+        row_l.addWidget(end_c)
+        row_l.addWidget(level_c)
+        row_l.addWidget(del_btn)
+
+        entry = (start_c, end_c, level_c, row_w)
+        self._row_widgets.append(entry)
+        self._rows_layout.addWidget(row_w)
+
+        def _del():
+            self._row_widgets.remove(entry)
+            row_w.setParent(None)
+        del_btn.clicked.connect(_del)
+
+    def get_rules(self):
+        rules = []
+        for start_c, end_c, level_c, _ in self._row_widgets:
+            s = start_c.currentIndex() + 6
+            e = end_c.currentIndex() + 6
+            if e > s:
+                rules.append({'start': s, 'end': e,
+                               'level': self._LEVEL_MAP[level_c.currentText()]})
+        return rules if rules else None
+
+    @staticmethod
+    def rules_summary(rules):
+        if not rules:
+            return "未配置（全程平常期）"
+        parts = []
+        lvl_cn = {'peak': '高峰期', 'normal': '平常期', 'trough': '低谷期'}
+        for r in rules:
+            parts.append(f"{r['start']:02d}:00~{r['end']:02d}:00 {lvl_cn.get(r['level'], r['level'])}")
+        return "  ".join(parts)
+
+
+class TopologyView(QWidget):
+    """
+    拓扑图交互视图
+    交互方式：
+      普通模式：拖拽节点，连线自动跟随
+      添加节点：点击工具栏按钮后进入十字光标模式，在画布任意位置单击即弹出属性框并创建节点
+      添加边：依次点击两个节点即可连线，移动鼠标时有虚线预览
+      删除：选中后按 Delete 键，或点击"删除"按钮
+      双击节点：编辑节点属性（ID / 类型 / 容量等）
+    """
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.layout = QVBoxLayout(self)
-        
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+
         # 工具栏
-        self.toolbar = QHBoxLayout()
-        self.add_node_button = QPushButton("添加节点")
-        self.add_edge_button = QPushButton("添加边")
-        self.delete_button = QPushButton("删除")
-        self.save_button = QPushButton("保存")
-        self.load_button = QPushButton("加载")
-        
-        self.toolbar.addWidget(self.add_node_button)
-        self.toolbar.addWidget(self.add_edge_button)
-        self.toolbar.addWidget(self.delete_button)
-        self.toolbar.addWidget(self.save_button)
-        self.toolbar.addWidget(self.load_button)
-        
-        self.layout.addLayout(self.toolbar)
-        
-        # 图形场景和视图
+        toolbar = QHBoxLayout()
+
+        self.add_node_btn = QPushButton("添加节点")
+        self.add_edge_btn = QPushButton("添加边")
+        self.delete_btn   = QPushButton("删除选中")
+
+        # 图例标签
+        legend_label = QLabel()
+        legend_label.setText(
+            '<span style="color:#27ae60">■入口</span> '
+            '<span style="color:#e74c3c">■出口</span> '
+            '<span style="color:#f39c12">■安检</span> '
+            '<span style="color:#2980b9">■售票</span> '
+            '<span style="color:#e67e22">■闸机</span> '
+            '<span style="color:#8e44ad">■站台</span> '
+            '<span style="color:#7f8c8d">■通道</span>'
+        )
+
+        toolbar.addWidget(self.add_node_btn)
+        toolbar.addWidget(self.add_edge_btn)
+        toolbar.addWidget(self.delete_btn)
+        toolbar.addStretch()
+        toolbar.addWidget(legend_label)
+        main_layout.addLayout(toolbar)
+
+        # 画布
         self.scene = QGraphicsScene()
+        self.scene.setBackgroundBrush(QBrush(QColor('#f8f9fa')))
+
         self.view = QGraphicsView(self.scene)
-        self.view.setSceneRect(0, 0, 800, 600)
+        self.view.setRenderHint(QPainter.Antialiasing, True)
+        self.view.setRenderHint(QPainter.SmoothPixmapTransform, True)
         self.view.setDragMode(QGraphicsView.RubberBandDrag)
-        
-        self.layout.addWidget(self.view)
-        
+        self.view.setSceneRect(0, 0, 900, 620)
+        main_layout.addWidget(self.view)
+
         # 状态
+        self.add_node_mode = False   # 添加节点模式
+        self.add_edge_mode = False
+        self.start_node    = None    # 添加边时记录起点
+        self.temp_edge     = None    # 预览虚线
+
+        # 数据映射
+        self.node_items: dict[str, NodeItem] = {}
+        self.edge_items: dict[tuple, EdgeItem] = {}
+
+        #信号连接
+        self.add_node_btn.clicked.connect(self.toggle_add_node_mode)
+        self.add_edge_btn.clicked.connect(self.toggle_add_edge_mode)
+        self.delete_btn.clicked.connect(self.delete_selected)
+
+        # 覆盖视图的鼠标事件
+        self.view.mousePressEvent      = self._mouse_press
+        self.view.mouseMoveEvent       = self._mouse_move
+        self.view.mouseReleaseEvent    = self._mouse_release
+        self.view.mouseDoubleClickEvent = self._mouse_double_click
+        # Delete 键删除选中项
+        self.view.keyPressEvent        = self._key_press
+
+        # 加载默认拓扑
+        self._load_default_topology()
+
+    ##  模式切换
+
+    def toggle_add_node_mode(self):
+
+        if self.add_edge_mode:
+            self._exit_add_edge_mode()
+
+        self.add_node_mode = not self.add_node_mode
+        if self.add_node_mode:
+            self.add_node_btn.setText("取消添加节点")
+            self.add_node_btn.setStyleSheet("background-color: #f39c12; color: white;")
+            self.view.setCursor(Qt.CrossCursor)
+        else:
+            self.add_node_btn.setText("添加节点")
+            self.add_node_btn.setStyleSheet("")
+            self.view.setCursor(Qt.ArrowCursor)
+
+    def toggle_add_edge_mode(self):
+        """切换添加边模式"""
+        # 先关闭添加节点模式
+        if self.add_node_mode:
+            self.toggle_add_node_mode()
+
+        self.add_edge_mode = not self.add_edge_mode
+        if self.add_edge_mode:
+            self.add_edge_btn.setText("取消添加边")
+            self.add_edge_btn.setStyleSheet("background-color: #2980b9; color: white;")
+            self.view.setCursor(Qt.PointingHandCursor)
+        else:
+            self._exit_add_edge_mode()
+
+    def _exit_add_edge_mode(self):
         self.add_edge_mode = False
         self.start_node = None
-        self.temp_edge = None
-        
-        # 节点和边的映射
-        self.node_items = {}
-        self.edge_items = {}
-        
-        # 信号连接
-        self.add_node_button.clicked.connect(self.add_node)
-        self.add_edge_button.clicked.connect(self.toggle_add_edge_mode)
-        self.delete_button.clicked.connect(self.delete_selected)
-        self.view.mousePressEvent = self.mouse_press_event
-        self.view.mouseMoveEvent = self.mouse_move_event
-        self.view.mouseReleaseEvent = self.mouse_release_event
-        self.view.mouseDoubleClickEvent = self.mouse_double_click_event
-    
-    def add_node(self):
-        """添加节点"""
-        dialog = NodeDialog(self)
+        self.add_edge_btn.setText("添加边")
+        self.add_edge_btn.setStyleSheet("")
+        self.view.setCursor(Qt.ArrowCursor)
+        if self.temp_edge:
+            self.scene.removeItem(self.temp_edge)
+            self.temp_edge = None
+
+
+    #  添加 / 删除节点和边
+    def _create_node_at(self, scene_x, scene_y):
+        """在指定场景坐标创建节点（弹出属性框）"""
+        dialog = NodeDialog(self, existing_ids=set(self.node_items.keys()))
         if dialog.exec_() == QDialog.Accepted:
             data = dialog.get_data()
             node_id = data['id']
             if node_id:
-                # 在鼠标位置创建节点
-                pos = self.view.mapToScene(QCursor.pos() - self.view.mapToGlobal(self.view.pos()))
-                node_item = NodeItem(node_id, data['type'], pos.x(), pos.y())
-                self.scene.addItem(node_item)
-                self.node_items[node_id] = node_item
-    
-    def toggle_add_edge_mode(self):
-        """切换添加边模式"""
-        self.add_edge_mode = not self.add_edge_mode
-        self.add_edge_button.setText("取消添加边" if self.add_edge_mode else "添加边")
-        self.start_node = None
-        if self.temp_edge:
-            self.scene.removeItem(self.temp_edge)
-            self.temp_edge = None
-    
+                item = NodeItem(node_id, data['type'], scene_x, scene_y,
+                                capacity=data['capacity'],
+                                area=data['area'],
+                                base_speed=data['base_speed'])
+                self.scene.addItem(item)
+                self.node_items[node_id] = item
+
     def delete_selected(self):
-        """删除选中的项"""
-        for item in self.scene.selectedItems():
+        """删除当前选中的节点或边"""
+        for item in list(self.scene.selectedItems()):
             if isinstance(item, NodeItem):
-                # 删除相关的边
-                edges_to_remove = []
-                for (from_node, to_node), edge_item in self.edge_items.items():
-                    if edge_item.from_node == item or edge_item.to_node == item:
-                        edges_to_remove.append((from_node, to_node))
-                
-                for edge_key in edges_to_remove:
-                    if edge_key in self.edge_items:
-                        self.scene.removeItem(self.edge_items[edge_key])
-                        del self.edge_items[edge_key]
-                
-                # 删除节点
-                del self.node_items[item.node_id]
-                self.scene.removeItem(item)
+                self._remove_node(item)
             elif isinstance(item, EdgeItem):
-                # 删除边
-                for (from_node, to_node), edge_item in self.edge_items.items():
-                    if edge_item == item:
-                        del self.edge_items[(from_node, to_node)]
-                        break
-                self.scene.removeItem(item)
-    
-    def mouse_press_event(self, event):
-        """鼠标按下事件"""
+                self._remove_edge_item(item)
+
+    def _remove_node(self, node_item: NodeItem):
+        """删除节点及其所有关联边"""
+        edges_to_del = [
+            key for key, edge in self.edge_items.items()
+            if edge.from_node is node_item or edge.to_node is node_item
+        ]
+        for key in edges_to_del:
+            self.scene.removeItem(self.edge_items.pop(key))
+
+        del self.node_items[node_item.node_id]
+        self.scene.removeItem(node_item)
+
+    def _remove_edge_item(self, edge_item: EdgeItem):
+        key_to_del = None
+        for key, item in self.edge_items.items():
+            if item is edge_item:
+                key_to_del = key
+                break
+        if key_to_del:
+            del self.edge_items[key_to_del]
+        self.scene.removeItem(edge_item)
+
+    #  鼠标事件
+    def _mouse_press(self, event):
+        scene_pos = self.view.mapToScene(event.pos())
+
+        #添加节点模式
+        if self.add_node_mode:
+            self._create_node_at(scene_pos.x(), scene_pos.y())
+            # 单次添加后自动退出模式（如需连续添加，可注释下行）
+            self.toggle_add_node_mode()
+            return
+
+        #添加边模式
         if self.add_edge_mode:
-            pos = event.pos()
-            item = self.view.itemAt(pos)
+            item = self.view.itemAt(event.pos())
+            # 点到了子项（文字标签）时，向上找父节点
+            while item and not isinstance(item, NodeItem):
+                item = item.parentItem()
+
             if isinstance(item, NodeItem):
-                if not self.start_node:
-                    # 选择起点
+                if self.start_node is None:
+                    # 记录起点，高亮提示
                     self.start_node = item
+                    item.setPen(QPen(QColor('#e74c3c'), 3))
                 else:
-                    # 选择终点
-                    if self.start_node != item:
-                        # 创建边
-                        edge_key = (self.start_node.node_id, item.node_id)
-                        if edge_key not in self.edge_items:
-                            edge_item = EdgeItem(self.start_node, item)
-                            self.scene.addItem(edge_item)
-                            self.edge_items[edge_key] = edge_item
-                    # 重置
+                    # 确定终点，创建边
+                    if self.start_node is not item:
+                        key = (self.start_node.node_id, item.node_id)
+                        if key not in self.edge_items:
+                            edge = EdgeItem(self.start_node, item)
+                            self.scene.addItem(edge)
+                            self.edge_items[key] = edge
+                    # 恢复起点外观并重置
+                    self.start_node.setPen(QPen(QColor('black'), 2))
                     self.start_node = None
-        else:
-            # 调用默认的鼠标事件处理
-            QGraphicsView.mousePressEvent(self.view, event)
-    
-    def mouse_move_event(self, event):
-        """鼠标移动事件"""
+                    if self.temp_edge:
+                        self.scene.removeItem(self.temp_edge)
+                        self.temp_edge = None
+            return
+
+        # 普通模式
+        QGraphicsView.mousePressEvent(self.view, event)
+
+    def _mouse_move(self, event):
+        # 添加边模式：绘制虚线预览
         if self.add_edge_mode and self.start_node:
-            # 绘制临时边
-            pos = self.view.mapToScene(event.pos())
+            scene_pos = self.view.mapToScene(event.pos())
+            fp = self.start_node.scenePos()
             if self.temp_edge:
                 self.scene.removeItem(self.temp_edge)
-            self.temp_edge = QGraphicsLineItem(self.start_node.x(), self.start_node.y(), pos.x(), pos.y())
-            self.temp_edge.setPen(QPen(QColor('gray'), 2, Qt.DashLine))
+            self.temp_edge = QGraphicsLineItem(fp.x(), fp.y(), scene_pos.x(), scene_pos.y())
+            self.temp_edge.setPen(QPen(QColor('#95a5a6'), 2, Qt.DashLine))
+            self.temp_edge.setZValue(-0.5)
             self.scene.addItem(self.temp_edge)
-        else:
-            # 调用默认的鼠标事件处理
-            QGraphicsView.mouseMoveEvent(self.view, event)
-    
-    def mouse_release_event(self, event):
-        """鼠标释放事件"""
-        if self.add_edge_mode and self.temp_edge:
-            self.scene.removeItem(self.temp_edge)
-            self.temp_edge = None
-        # 调用默认的鼠标事件处理
+            return
+
+        QGraphicsView.mouseMoveEvent(self.view, event)
+
+    def _mouse_release(self, event):
         QGraphicsView.mouseReleaseEvent(self.view, event)
-    
-    def mouse_double_click_event(self, event):
-        """鼠标双击事件"""
-        pos = event.pos()
-        item = self.view.itemAt(pos)
-        
-        if isinstance(item, NodeItem):
-            # 双击编辑节点属性
-            node_data = {
-                'id': item.node_id,
-                'type': item.node_type,
-                'capacity': 50,  # 默认值
-                'area': 100.0,  # 默认值
-                'base_speed': 1.0  # 默认值
-            }
-            dialog = NodeDialog(self, node_data)
-            if dialog.exec_() == QDialog.Accepted:
-                new_data = dialog.get_data()
-                new_node_id = new_data['id']
-                
-                if new_node_id and new_node_id != item.node_id:
-                    # 更新节点ID
-                    del self.node_items[item.node_id]
-                    item.node_id = new_node_id
-                    self.node_items[new_node_id] = item
-                
-                # 更新节点类型
-                if new_data['type'] != item.node_type:
-                    item.node_type = new_data['type']
-                    item.setBrush(item._get_brush())
+
+    def _key_press(self, event):
+        """Delete / Backspace 键删除选中的节点或边"""
+        if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+            self.delete_selected()
         else:
-            # 双击添加节点
-            dialog = NodeDialog(self)
-            if dialog.exec_() == QDialog.Accepted:
-                data = dialog.get_data()
-                node_id = data['id']
-                if node_id:
-                    # 在双击位置创建节点
-                    scene_pos = self.view.mapToScene(pos)
-                    node_item = NodeItem(node_id, data['type'], scene_pos.x(), scene_pos.y())
-                    self.scene.addItem(node_item)
-                    self.node_items[node_id] = node_item
-    
-    def update_congestion(self, congestion_data):
-        """更新拥堵状态"""
-        for node_id, congestion in congestion_data.items():
-            if node_id in self.node_items:
-                self.node_items[node_id].update_congestion(congestion)
-        
-        for (from_node, to_node), edge_item in self.edge_items.items():
-            # 这里需要获取边的拥堵系数数据
-            # 暂时使用默认值
-            edge_item.update_congestion(1.0)
-    
-    def get_graph(self):
-        """获取图结构"""
-        graph = StationGraph()
-        
-        # 添加节点
+            QGraphicsView.keyPressEvent(self.view, event)
+
+    def _mouse_double_click(self, event):
+        #双击节点可 编辑属性；双击空白可快速添加节点
+        item = self.view.itemAt(event.pos())
+        while item and not isinstance(item, NodeItem):
+            item = item.parentItem()
+
+        if isinstance(item, NodeItem):
+            self._edit_node(item)
+        else:
+            scene_pos = self.view.mapToScene(event.pos())
+            self._create_node_at(scene_pos.x(), scene_pos.y())
+
+
+    ##  编辑节点属性
+
+    def _edit_node(self, item: NodeItem):
+        existing = set(self.node_items.keys())
+        node_data = {
+            'id':         item.node_id,
+            'type':       item.node_type,
+            'capacity':   item.capacity,
+            'area':       item.area,
+            'base_speed': item.base_speed,
+        }
+        dialog = NodeDialog(self, node_data, existing_ids=existing)
+        if dialog.exec_() == QDialog.Accepted:
+            new_data = dialog.get_data()
+            new_id   = new_data['id']
+            new_type = new_data['type']
+
+
+            item.capacity   = new_data['capacity']
+            item.area       = new_data['area']
+            item.base_speed = new_data['base_speed']
+
+            # 更新ID（如果变更）
+            if new_id != item.node_id:
+                new_edges = {}
+                for (f, t), edge in self.edge_items.items():
+                    nf = new_id if f == item.node_id else f
+                    nt = new_id if t == item.node_id else t
+                    new_edges[(nf, nt)] = edge
+                self.edge_items = new_edges
+                del self.node_items[item.node_id]
+                item.node_id = new_id
+                item.id_text.setPlainText(new_id)
+                self.node_items[new_id] = item
+
+            # 更新类型和颜色
+            if new_type != item.node_type:
+                item.node_type = new_type
+                item.setBrush(item._get_brush())
+
+
+    ##  仿真数据更新
+    def update_view(self, graph, passengers):
+        """仿真运行中刷新拓扑图（保留当前节点位置）"""
+        # 只更新乘客人数标签，不重建整个图
+        node_counts = {}
+        for p in passengers:
+            node_counts[p.current_node] = node_counts.get(p.current_node, 0) + 1
         for node_id, item in self.node_items.items():
-            # 这里需要获取节点的完整属性
+            item.update_passenger_count(node_counts.get(node_id, 0))
+
+    def update_congestion(self, congestion_data: dict):
+        """根据密度数据更新节点拥堵色"""
+        max_val = max(congestion_data.values()) if congestion_data else 1.0
+        max_val = max(max_val, 0.001)
+        for node_id, val in congestion_data.items():
+            if node_id in self.node_items:
+                self.node_items[node_id].update_congestion(val / max_val)
+
+        for (f, t), edge_item in self.edge_items.items():
+            # 取两端节点密度均值作为边的拥堵参考
+            cf = (congestion_data.get(f, 0) + congestion_data.get(t, 0)) / (2 * max_val + 1e-6)
+            edge_item.update_congestion(1.0 + cf * 2)
+
+    def reset(self):
+        """重置画布，恢复默认拓扑"""
+        self.scene.clear()
+        self.node_items.clear()
+        self.edge_items.clear()
+        self._load_default_topology()
+
+    ##  导出 StationGraph 供仿真使用
+    def get_graph(self) -> StationGraph:
+        """将当前画布上的节点和边转换为 StationGraph（带完整属性）"""
+        graph = StationGraph()
+        for node_id, item in self.node_items.items():
+            pos = item.scenePos()
             graph.add_node(
-                node_id,
-                item.node_type,
-                50,  # 默认容量
-                item.x(),
-                item.y(),
-                area=100.0,
-                base_speed=1.0
+                node_id, item.node_type, item.capacity,
+                pos.x(), pos.y(),
+                area=item.area, base_speed=item.base_speed
             )
-        
-        # 添加边
-        for (from_node, to_node), item in self.edge_items.items():
-            # 计算距离
-            distance = ((item.from_node.x() - item.to_node.x()) ** 2 + 
-                       (item.from_node.y() - item.to_node.y()) ** 2) ** 0.5
-            graph.add_edge(from_node, to_node, distance, 2)
-        
+        for (f, t), item in self.edge_items.items():
+            fp   = item.from_node.scenePos()
+            tp   = item.to_node.scenePos()
+            dist = ((fp.x()-tp.x())**2 + (fp.y()-tp.y())**2) ** 0.5
+            graph.add_edge(f, t, max(dist, 1.0), 2, capacity=10, base_time=1.0)
         return graph
 
+
+    ##  默认拓扑
+    def _load_default_topology(self):
+        """加载默认的中型站拓扑（2条线路）"""
+        n = 2  # 每类节点数量
+
+        # 坐标布局（x 按流程递进，y 按索引分布）
+        layout = {
+            'entrance':  (60,  80),
+            'ticket':    (180, 80),
+            'security':  (300, 80),
+            'gate':      (420, 80),
+            'corridor':  (520, 160),  # 汇聚点
+            'stairs':    (620, 80),
+            'escalator': (620, 160),
+            'platform':  (760, 80),
+            'exit':      (880, 80),
+        }
+        y_step = 120
+
+        def add(nid, ntype, x, y):
+            item = NodeItem(nid, ntype, x, y)
+            self.scene.addItem(item)
+            self.node_items[nid] = item
+
+        def connect(fid, tid):
+            if fid in self.node_items and tid in self.node_items:
+                key = (fid, tid)
+                if key not in self.edge_items:
+                    edge = EdgeItem(self.node_items[fid], self.node_items[tid])
+                    self.scene.addItem(edge)
+                    self.edge_items[key] = edge
+
+        for i in range(1, n + 1):
+            dy = (i - 1) * y_step
+            add(f'entrance{i}',  'entrance',  layout['entrance'][0],  layout['entrance'][1]  + dy)
+            add(f'ticket{i}',    'ticket',    layout['ticket'][0],    layout['ticket'][1]    + dy)
+            add(f'security{i}',  'security',  layout['security'][0],  layout['security'][1]  + dy)
+            add(f'gate{i}',      'gate',      layout['gate'][0],      layout['gate'][1]      + dy)
+            add(f'stairs{i}',    'stairs',    layout['stairs'][0],    layout['stairs'][1]    + dy)
+            add(f'escalator{i}', 'escalator', layout['escalator'][0], layout['escalator'][1] + dy)
+            add(f'platform{i}',  'platform',  layout['platform'][0],  layout['platform'][1]  + dy)
+            add(f'exit{i}',      'exit',      layout['exit'][0],      layout['exit'][1]      + dy)
+
+        # 通道（汇聚点，只加一个）
+        add('corridor1', 'corridor', layout['corridor'][0], layout['corridor'][1])
+
+        # 连接
+        for i in range(1, n + 1):
+            connect(f'entrance{i}',  f'ticket{i}')
+            connect(f'ticket{i}',    f'security{i}')
+            connect(f'security{i}',  f'gate{i}')
+            connect(f'gate{i}',      'corridor1')
+            connect('corridor1',     f'stairs{i}')
+            connect('corridor1',     f'escalator{i}')
+            connect(f'stairs{i}',    f'platform{i}')
+            connect(f'escalator{i}', f'platform{i}')
+            connect(f'platform{i}',  f'exit{i}')
+
+
+
+###  热力图视图
 class HeatmapView(FigureCanvas):
-    """热力图视图"""
-    
+    """密度热力图（嵌入 Qt）"""
+
     def __init__(self, parent=None):
         self.fig = Figure(figsize=(8, 6), dpi=100)
         super().__init__(self.fig)
         self.setParent(parent)
-        self.ax = self.fig.add_subplot(111)
-        self.ax.set_title("密度热力图")
-        self.ax.text(0.5, 0.5, "请先开始仿真", ha='center', va='center')
-        self.draw()
-    
-    def update_view(self, graph, densities):
-        """更新热力图"""
+        self._draw_placeholder()
+
+    def _draw_placeholder(self):
         self.fig.clear()
-        self.ax = self.fig.add_subplot(111)
-        
-        # 获取节点坐标
-        node_coords = {}
-        for node, data in graph.nodes(data=True):
-            node_coords[node] = (data['x'], data['y'])
-        
-        # 绘制热力图
-        if node_coords:
-            x_coords = [x for x, y in node_coords.values()]
-            y_coords = [y for x, y in node_coords.values()]
-            density_values = [densities.get(node, 0) for node in node_coords.keys()]
-            
-            # 绘制散点图，颜色表示密度
-            scatter = self.ax.scatter(x_coords, y_coords, c=density_values, cmap='hot', s=100, alpha=0.7)
-            
-            # 添加颜色条
-            self.fig.colorbar(scatter, ax=self.ax, label='密度')
-            
-            # 添加节点标签
-            for node, (x, y) in node_coords.items():
-                self.ax.text(x, y, node, ha='center', va='center', fontsize=8, color='black')
-        
-        self.ax.set_title("密度热力图")
-        self.draw()
-    
-    def reset(self):
-        """重置视图"""
-        self.fig.clear()
-        self.ax = self.fig.add_subplot(111)
-        self.ax.set_title("密度热力图")
-        self.ax.text(0.5, 0.5, "请先开始仿真", ha='center', va='center')
+        ax = self.fig.add_subplot(111)
+        ax.set_facecolor('#f8f9fa')
+        ax.text(0.5, 0.5, "请先开始仿真", ha='center', va='center',
+                fontsize=14, color='#7f8c8d')
+        ax.axis('off')
         self.draw()
 
+    def update_view(self, graph, densities: dict):
+        self.fig.clear()
+        ax = self.fig.add_subplot(111)
+
+        coords = {n: (d['x'], d['y']) for n, d in graph.nodes(data=True)}
+        if not coords:
+            self.draw()
+            return
+
+        nodes = list(coords.keys())
+        xs    = [coords[n][0] for n in nodes]
+        ys    = [coords[n][1] for n in nodes]
+        vals  = [densities.get(n, 0) for n in nodes]
+        vmax  = max(max(vals), 0.01)
+
+        # 绘制边
+        for u, v in graph.edges():
+            if u in coords and v in coords:
+                ax.plot([coords[u][0], coords[v][0]],
+                        [coords[u][1], coords[v][1]],
+                        color='#aab4be', linewidth=1.5, zorder=1,
+                        solid_capstyle='round')
+
+        # 绘制节点散点
+        sc = ax.scatter(xs, ys, c=vals, cmap='YlOrRd', s=500,
+                        alpha=0.90, edgecolors='#444', linewidths=1.2,
+                        vmin=0, vmax=vmax, zorder=2)
+        cbar = self.fig.colorbar(sc, ax=ax, shrink=0.7, pad=0.02)
+        cbar.set_label('密度 (人/m²)', fontsize=10)
+        cbar.ax.tick_params(labelsize=9)
+
+
+        for n, (x, y) in coords.items():
+            d_val = densities.get(n, 0)
+
+
+            ax.text(x, y, n,
+                    ha='center', va='center',
+                    fontsize=7, fontweight='bold',
+                    color='#0a4a0a', zorder=6,
+                    clip_on=True)
+
+            # 密度数值：写在节点正下方固定像素偏移处（用 transform offset）
+
+            ax.annotate(
+                f'{d_val:.3f}',
+                xy=(x, y),
+                xytext=(0, -22),
+                textcoords='offset points',
+                ha='center', va='top',
+                fontsize=8,
+                color='#1a5c1a',   # 深绿色
+                fontweight='bold',
+                zorder=6,
+                bbox=dict(boxstyle='round,pad=0.15',
+                          facecolor='white', edgecolor='#aaa',
+                          alpha=0.90, linewidth=0.6),
+            )
+
+        ax.set_title("密度热力图", fontsize=13, fontweight='bold', pad=10)
+        ax.set_facecolor('#f0f4f8')
+        ax.axis('off')
+        self.fig.tight_layout()
+        self.draw()
+
+    def reset(self):
+        self._draw_placeholder()
+
+
+
+#  实时数据折线图
 class RealtimeDataView(QWidget):
-    """实时数据视图"""
-    
+    _DAY_START = 6 * 3600    # 06:00
+    _DAY_END   = 24 * 3600   # 24:00
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.layout = QVBoxLayout(self)
-        
-        # 使用matplotlib创建图表
-        self.fig = Figure(figsize=(8, 6), dpi=100)
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+
+        # ── 操作提示 + 复位按钮 ───────────────────
+        hint_row = QHBoxLayout()
+        hint_lbl = QLabel("🖱 滚轮缩放  ·  拖拽平移")
+        hint_lbl.setStyleSheet("color: #888; font-size: 8pt;")
+        self._reset_view_btn = QPushButton("复位视图")
+        self._reset_view_btn.setFixedHeight(24)
+        self._reset_view_btn.setMinimumWidth(80)
+        self._reset_view_btn.setStyleSheet("font-size: 8pt;")
+        self._reset_view_btn.clicked.connect(self._reset_xlim)
+        hint_row.addWidget(hint_lbl)
+        hint_row.addStretch()
+        hint_row.addWidget(self._reset_view_btn)
+        main_layout.addLayout(hint_row)
+
+        # 图表
+        self.fig = Figure(figsize=(8, 5), dpi=100)
         self.canvas = FigureCanvas(self.fig)
+        main_layout.addWidget(self.canvas)
+
         self.ax = self.fig.add_subplot(111)
+        self._start_sec = self._DAY_START
+        self._total_steps = 3600
+
+        self.time_data      = []
+        self.passenger_data = []
+        self.density_data   = []
+        self.queue_data     = []
+
+        self._setup_axis()
+
+        self.line_p, = self.ax.plot([], [], 'b-',  label='乘客数量',    linewidth=2)
+        self.line_d, = self.ax.plot([], [], 'g--', label='平均密度×10', linewidth=2)
+        self.line_q, = self.ax.plot([], [], 'r:',  label='最长队列',    linewidth=2)
+        self.ax.legend(loc='upper left', fontsize=9)
+
+        #拖拽状态
+        self._drag_x = None
+
+        #绑定鼠标事件
+        self.canvas.mpl_connect('scroll_event',         self._on_scroll)
+        self.canvas.mpl_connect('button_press_event',   self._on_press)
+        self.canvas.mpl_connect('motion_notify_event',  self._on_drag)
+        self.canvas.mpl_connect('button_release_event', self._on_release)
+
+    # 轴初始化
+    def _setup_axis(self):
+        import matplotlib.ticker as mticker
+        self.ax.cla()
         self.ax.set_title("实时数据监控")
-        self.ax.set_xlabel("时间 (秒)")
+        self.ax.set_xlabel("时间")
         self.ax.set_ylabel("数值")
-        self.ax.grid(True)
-        
-        self.layout.addWidget(self.canvas)
-        
-        # 数据存储
-        self.time_data = []
-        self.passenger_data = []
-        self.density_data = []
-        self.queue_data = []
-        
-        # 绘制线条
-        self.passenger_line, = self.ax.plot([], [], 'b-', label='乘客数量')
-        self.density_line, = self.ax.plot([], [], 'g-', label='平均密度')
-        self.queue_line, = self.ax.plot([], [], 'r-', label='最长队列')
-        
-        # 添加图例
-        self.ax.legend()
-    
-    def update_data(self, time, passenger_count, avg_density=0, max_queue=0):
-        """更新数据"""
-        self.time_data.append(time)
-        self.passenger_data.append(passenger_count)
-        self.density_data.append(avg_density)
+        self.ax.grid(True, which='major', alpha=0.3)
+        self.ax.grid(True, which='minor', alpha=0.1)
+        self.ax.set_xlim(self._DAY_START, self._DAY_END)
+
+        # Y 轴始终贴左侧
+        self.ax.spines['left'].set_position(('axes', 0))
+        self.ax.yaxis.set_ticks_position('left')
+
+        self.ax.xaxis.set_major_locator(mticker.MultipleLocator(3600))
+        self.ax.xaxis.set_minor_locator(mticker.MultipleLocator(600))
+
+        def _fmt(x, pos):
+            h = int(x) // 3600 % 24
+            m = (int(x) % 3600) // 60
+            return f"{h:02d}:{m:02d}"
+        self.ax.xaxis.set_major_formatter(mticker.FuncFormatter(_fmt))
+        self.fig.autofmt_xdate(rotation=30, ha='right')
+        self.fig.subplots_adjust(left=0.10)
+
+    # 滚轮缩放
+    def _on_scroll(self, event):
+        if event.inaxes != self.ax or event.xdata is None:
+            return
+        xmin, xmax = self.ax.get_xlim()
+        span = xmax - xmin
+        factor = 0.85 if event.button == 'up' else 1.0 / 0.85
+        new_span = span * factor
+        cx = event.xdata
+        ratio = (cx - xmin) / span
+        new_xmin = cx - ratio * new_span
+        new_xmax = cx + (1 - ratio) * new_span
+        new_xmin = max(new_xmin, self._DAY_START)
+        new_xmax = min(new_xmax, self._DAY_END)
+        if new_xmax - new_xmin < 300:
+            return
+        self.ax.set_xlim(new_xmin, new_xmax)
+        self._fit_ylim(new_xmin, new_xmax)
+        self.canvas.draw_idle()
+
+    # 拖拽平移
+    def _on_press(self, event):
+        if event.inaxes != self.ax or event.button != 1:
+            return
+        self._drag_x = event.xdata
+
+    def _on_drag(self, event):
+        if self._drag_x is None or event.inaxes != self.ax or event.xdata is None:
+            return
+        dx = self._drag_x - event.xdata
+        xmin, xmax = self.ax.get_xlim()
+        span = xmax - xmin
+        new_xmin = xmin + dx
+        new_xmax = xmax + dx
+        if new_xmin < self._DAY_START:
+            new_xmin = self._DAY_START
+            new_xmax = self._DAY_START + span
+        if new_xmax > self._DAY_END:
+            new_xmax = self._DAY_END
+            new_xmin = self._DAY_END - span
+        self.ax.set_xlim(new_xmin, new_xmax)
+        self._fit_ylim(new_xmin, new_xmax)
+        self.canvas.draw_idle()
+
+    def _on_release(self, event):
+        self._drag_x = None
+
+    # 复位
+    def _reset_xlim(self):
+        self.ax.set_xlim(self._DAY_START, self._DAY_END)
+        self.ax.relim()
+        self.ax.autoscale_view(scalex=False)
+        self.canvas.draw_idle()
+
+    # Y 轴随可见数据自适应
+    def _fit_ylim(self, xmin, xmax):
+        visible = [v for t, p, d, q in zip(self.time_data, self.passenger_data,
+                                            self.density_data, self.queue_data)
+                   if xmin <= t <= xmax for v in (p, d, q)]
+        if visible:
+            lo, hi = min(visible), max(visible)
+            margin = (hi - lo) * 0.1 or 1
+            self.ax.set_ylim(lo - margin, hi + margin)
+
+    # 外部接口
+    def set_start_hour(self, hour):
+        self._start_sec = hour * 3600
+
+    def set_total_steps(self, steps):
+        self._total_steps = steps
+
+    def mark_finished(self):
+        pass   # 接口兼容保留
+
+    def update_data(self, step, passengers, avg_density=0, max_queue=0):
+        abs_sec = self._start_sec + step
+        if abs_sec > self._DAY_END:
+            return
+        self.time_data.append(abs_sec)
+        self.passenger_data.append(passengers)
+        self.density_data.append(avg_density * 10)
         self.queue_data.append(max_queue)
-        
-        # 只显示最近50个数据点
-        if len(self.time_data) > 50:
-            self.time_data = self.time_data[-50:]
-            self.passenger_data = self.passenger_data[-50:]
-            self.density_data = self.density_data[-50:]
-            self.queue_data = self.queue_data[-50:]
-        
-        # 更新图表
-        self.passenger_line.set_data(self.time_data, self.passenger_data)
-        self.density_line.set_data(self.time_data, self.density_data)
-        self.queue_line.set_data(self.time_data, self.queue_data)
-        
+
+        self.line_p.set_data(self.time_data, self.passenger_data)
+        self.line_d.set_data(self.time_data, self.density_data)
+        self.line_q.set_data(self.time_data, self.queue_data)
         self.ax.relim()
-        self.ax.autoscale_view()
-        self.canvas.draw()
-    
+        self.ax.autoscale_view(scalex=False)
+        self.canvas.draw_idle()
+
     def reset(self):
-        """重置视图"""
-        self.time_data = []
+        self.time_data      = []
         self.passenger_data = []
-        self.density_data = []
-        self.queue_data = []
-        
-        self.passenger_line.set_data([], [])
-        self.density_line.set_data([], [])
-        self.queue_line.set_data([], [])
-        
-        self.ax.relim()
-        self.ax.autoscale_view()
+        self.density_data   = []
+        self.queue_data     = []
+        self._drag_x        = None
+        self._start_sec     = self._DAY_START
+        self._setup_axis()
+        self.line_p, = self.ax.plot([], [], 'b-',  label='乘客数量',    linewidth=2)
+        self.line_d, = self.ax.plot([], [], 'g--', label='平均密度×10', linewidth=2)
+        self.line_q, = self.ax.plot([], [], 'r:',  label='最长队列',    linewidth=2)
+        self.ax.legend(loc='upper left', fontsize=9)
         self.canvas.draw()
 
+
+
+##  分析报告视图
 class AnalyticsView(QWidget):
-    """分析报告视图"""
-    
+    """文字版分析报告"""
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.layout = QVBoxLayout(self)
-        
-        # 创建文本编辑框
+        layout = QVBoxLayout(self)
         self.text_edit = QTextEdit()
         self.text_edit.setReadOnly(True)
-        self.text_edit.setPlainText("分析报告将在此显示...")
-        
-        self.layout.addWidget(self.text_edit)
-    
-    def update_report(self, report):
-        """更新分析报告"""
-        text = "分析报告\n"
-        text += "====================\n\n"
-        
-        if report['passenger_stats']:
-            text += "乘客统计:\n"
-            text += f"平均等待时间: {report['passenger_stats']['average_wait_time']:.2f}秒\n"
-            text += f"最大等待时间: {report['passenger_stats']['max_wait_time']:.2f}秒\n"
-            text += f"最小等待时间: {report['passenger_stats']['min_wait_time']:.2f}秒\n"
-            text += f"乘客数量: {report['passenger_stats']['passenger_count']}\n"
-            text += f"状态分布: {report['passenger_stats']['state_distribution']}\n\n"
-        
-        if report['density_stats']:
-            text += "密度统计:\n"
-            text += f"平均密度: {report['density_stats']['average_density']:.2f}\n"
-            text += f"最大密度: {report['density_stats']['max_density']:.2f}\n"
-            text += f"最小密度: {report['density_stats']['min_density']:.2f}\n"
-            text += f"拥堵节点: {report['density_stats']['congested_nodes']}\n\n"
-        
-        if report['bottlenecks']:
-            text += "瓶颈节点:\n"
-            text += f"{report['bottlenecks']}\n\n"
-        
-        if report['top_congested_nodes']:
-            text += "最拥堵节点:\n"
-            text += f"{report['top_congested_nodes']}\n\n"
-        
-        if report['visit_counts']:
-            text += "累计访问量:\n"
-            sorted_visits = sorted(report['visit_counts'].items(), key=lambda x: x[1], reverse=True)
-            for node, count in sorted_visits[:10]:  # 显示前10个
-                text += f"{node}: {count}\n"
-        
-        self.text_edit.setPlainText(text)
-    
-    def reset(self):
-        """重置视图"""
-        self.text_edit.setPlainText("分析报告将在此显示...")
+        self.text_edit.setPlainText("分析报告将在仿真结束后显示...")
+        layout.addWidget(self.text_edit)
 
+    def update_report(self, report: dict):
+        lines = ["=" * 40, "  分析报告", "=" * 40, ""]
+
+        ps = report.get('passenger_stats')
+        if ps:
+            lines += [
+                "【乘客统计】",
+                f"  乘客总数     : {ps.get('passenger_count', 0)}",
+                f"  平均等待时间 : {ps.get('average_wait_time', 0):.2f} 秒",
+                f"  最大等待时间 : {ps.get('max_wait_time', 0):.2f} 秒",
+                f"  状态分布     : {ps.get('state_distribution', {})}",
+                "",
+            ]
+
+        ds = report.get('density_stats')
+        if ds:
+            lines += [
+                "【密度统计】",
+                f"  平均密度 : {ds.get('average_density', 0):.4f} 人/m²",
+                f"  最大密度 : {ds.get('max_density', 0):.4f} 人/m²",
+                f"  拥堵节点 : {ds.get('congested_nodes', [])}",
+                "",
+            ]
+
+        bn = report.get('bottlenecks', [])
+        if bn:
+            lines += ["【瓶颈节点】", f"  {bn}", ""]
+
+        top = report.get('top_congested_nodes', [])
+        if top:
+            lines += ["【最拥堵 Top5】", f"  {top}", ""]
+
+        vc = report.get('visit_counts', {})
+        if vc:
+            lines.append("【累计访问量 Top10】")
+            for node, cnt in sorted(vc.items(), key=lambda x: -x[1])[:10]:
+                lines.append(f"  {node:<20} : {cnt}")
+
+        self.text_edit.setPlainText("\n".join(lines))
+
+    def reset(self):
+        self.text_edit.setPlainText("分析报告将在仿真结束后显示...")
+
+
+##  仿真业务层
+class SubwaySimulation:
+    """封装仿真引擎的业务类"""
+
+    def __init__(self, station_size="中型站", operation_time="",
+                 custom_graph=None, total_steps=3600,
+                 period_rules=None, start_hour=6):
+        self.station_size   = station_size
+        self.operation_time = operation_time
+
+        self.peak_hours = [(0, total_steps)]
+
+        self.station_graph = custom_graph if custom_graph else self._create_station_graph()
+        self.path_planner  = PathPlanner(self.station_graph)
+        self.simulation    = SimulationEngine(
+            self.station_graph, self.path_planner, self.peak_hours,
+            period_rules=period_rules, start_hour=start_hour
+        )
+        self.analytics     = AnalyticsModule(self.station_graph)
+
+    def _parse_operation_time(self, s):
+        try:
+            result = []
+            for part in s.split(','):
+                a, b = part.split('-')
+                result.append((int(a.strip()), int(b.strip())))
+            return result
+        except Exception:
+            return [(7, 9), (17, 19)]
+
+    def _create_station_graph(self):
+        graph = StationGraph()
+        cfg = {
+            "小型站": dict(ec=30, tc=20, sc=15, gc=10, cc=80,  pc=150, xc=30, n=1),
+            "中型站": dict(ec=50, tc=30, sc=20, gc=15, cc=100, pc=200, xc=50, n=2),
+            "大型站": dict(ec=80, tc=50, sc=30, gc=25, cc=150, pc=300, xc=80, n=3),
+        }
+        c = cfg.get(self.station_size, cfg["中型站"])
+        n = c['n']
+
+        for i in range(1, n + 1):
+            graph.add_node(f'entrance{i}',  'entrance',  c['ec'], 0,  5*i, area=100.0, base_speed=1.0)
+            graph.add_node(f'ticket{i}',    'ticket',    c['tc'], 5,  5*i, area=80.0,  base_speed=0.8)
+            graph.add_node(f'security{i}',  'security',  c['sc'], 10, 5*i, area=60.0,  base_speed=0.6)
+            graph.add_node(f'gate{i}',      'gate',      c['gc'], 15, 5*i, area=40.0,  base_speed=1.0)
+            graph.add_node(f'stairs{i}',    'stairs',    10,      25, 5*i, area=30.0,  base_speed=0.5)
+            graph.add_node(f'escalator{i}', 'escalator', 20,      25, 5*i+2.5, area=50.0, base_speed=0.8)
+            graph.add_node(f'platform{i}',  'platform',  c['pc'], 30, 5*i, area=400.0, base_speed=1.0)
+            graph.add_node(f'exit{i}',      'exit',      c['xc'], 35, 5*i, area=100.0, base_speed=1.0)
+
+        graph.add_node('corridor1', 'corridor', c['cc'], 20, 10, area=200.0, base_speed=1.2)
+
+        for i in range(1, n + 1):
+            graph.add_edge(f'entrance{i}',  f'ticket{i}',    5, 2, capacity=10, base_time=1.0)
+            graph.add_edge(f'ticket{i}',    f'security{i}',  5, 2, capacity=8,  base_time=1.0)
+            graph.add_edge(f'security{i}',  f'gate{i}',      5, 2, capacity=5,  base_time=1.0)
+            graph.add_edge(f'gate{i}',      'corridor1',     5, 3, capacity=15, base_time=1.0)
+            graph.add_edge('corridor1',     f'stairs{i}',    5, 2, capacity=8,  base_time=1.0)
+            graph.add_edge('corridor1',     f'escalator{i}', 5, 3, capacity=12, base_time=1.0)
+            graph.add_edge(f'stairs{i}',    f'platform{i}',  10, 2, capacity=6, base_time=2.0)
+            graph.add_edge(f'escalator{i}', f'platform{i}',  10, 3, capacity=10, base_time=1.5)
+            graph.add_edge(f'platform{i}',  f'exit{i}',      5, 2, capacity=10, base_time=1.0)
+
+        return graph
+
+    def run_simulation_step(self):
+        self.simulation.step()
+
+    def generate_analytics(self):
+        passengers = self.simulation.get_passengers()
+        densities  = {
+            node: (self.station_graph.get_node(node) or {}).get('current_density', 0)
+            for node in self.station_graph.get_graph().nodes()
+        }
+        self.analytics.record_data(self.simulation.get_current_time(), passengers, densities)
+        return self.analytics.generate_report()
+
+
+##  主窗口
 class SubwaySimulationGUI(QMainWindow):
-    """地铁站人流仿真系统GUI"""
-    
+    """地铁站人流仿真系统主窗口"""
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("地铁站人流仿真系统")
-        self.setGeometry(100, 100, 1200, 800)
-        
-        # 设置中文字体
-        font = QFont("SimHei", 9)
-        QApplication.setFont(font)
-        
-        # 创建仿真系统
-        self.simulation = None
+        self.setWindowIcon(QIcon("icon.png"))
+        self.setGeometry(80, 80, 1280, 820)
+
+
+        _app_font = _get_qt_chinese_font(9)
+        QApplication.setFont(_app_font)
+
+        self.simulation        = None
         self.simulation_thread = None
-        
-        # 创建中心部件
-        self.central_widget = QWidget()
-        self.setCentralWidget(self.central_widget)
-        
-        # 创建主布局
-        self.main_layout = QHBoxLayout(self.central_widget)
-        
-        # 创建左侧控制面板
-        self.control_panel = QWidget()
-        self.control_layout = QVBoxLayout(self.control_panel)
-        self.control_layout.setContentsMargins(10, 10, 10, 10)
-        
-        # 仿真控制
-        self.control_group = QFrame()
-        self.control_group.setFrameShape(QFrame.Box)
-        self.control_group.setFrameShadow(QFrame.Sunken)
-        self.control_group_layout = QVBoxLayout(self.control_group)
-        self.control_group_layout.setContentsMargins(10, 10, 10, 10)
-        
-        self.control_group_layout.addWidget(QLabel("仿真控制"))
-        
-        # 控制按钮
-        self.button_layout = QHBoxLayout()
-        
-        self.start_button = QPushButton("开始仿真")
-        self.start_button.clicked.connect(self.start_simulation)
-        self.button_layout.addWidget(self.start_button)
-        
-        self.pause_button = QPushButton("暂停仿真")
-        self.pause_button.clicked.connect(self.pause_simulation)
-        self.pause_button.setEnabled(False)
-        self.button_layout.addWidget(self.pause_button)
-        
-        self.stop_button = QPushButton("停止仿真")
-        self.stop_button.clicked.connect(self.stop_simulation)
-        self.stop_button.setEnabled(False)
-        self.button_layout.addWidget(self.stop_button)
-        
-        self.reset_button = QPushButton("重置仿真")
-        self.reset_button.clicked.connect(self.reset_simulation)
-        self.reset_button.setEnabled(False)
-        self.button_layout.addWidget(self.reset_button)
-        
-        self.control_group_layout.addLayout(self.button_layout)
-        
-        # 仿真参数
-        self.params_group = QFrame()
-        self.params_group.setFrameShape(QFrame.Box)
-        self.params_group.setFrameShadow(QFrame.Sunken)
-        self.params_group_layout = QVBoxLayout(self.params_group)
-        self.params_group_layout.setContentsMargins(10, 10, 10, 10)
-        
-        self.params_group_layout.addWidget(QLabel("仿真参数"))
-        
-        # 仿真步数
-        self.steps_layout = QHBoxLayout()
-        self.steps_layout.addWidget(QLabel("仿真步数:"))
-        self.steps_edit = QLineEdit("100")
-        self.steps_layout.addWidget(self.steps_edit)
-        self.params_group_layout.addLayout(self.steps_layout)
-        
-        # 高峰期乘客生成速率
-        self.peak_rate_layout = QHBoxLayout()
-        self.peak_rate_layout.addWidget(QLabel("高峰期乘客生成速率:"))
-        self.peak_rate_edit = QLineEdit("10")
-        self.peak_rate_layout.addWidget(self.peak_rate_edit)
-        self.params_group_layout.addLayout(self.peak_rate_layout)
-        
-        # 平峰期乘客生成速率
-        self.normal_rate_layout = QHBoxLayout()
-        self.normal_rate_layout.addWidget(QLabel("平峰期乘客生成速率:"))
-        self.normal_rate_edit = QLineEdit("5")
-        self.normal_rate_layout.addWidget(self.normal_rate_edit)
-        self.params_group_layout.addLayout(self.normal_rate_layout)
-        
-        # 路径规划模式
-        self.path_mode_layout = QHBoxLayout()
-        self.path_mode_layout.addWidget(QLabel("路径规划模式:"))
+
+        # 中心部件
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QHBoxLayout(central)
+
+        # 左侧控制面板
+        ctrl_panel = QWidget()
+        ctrl_panel.setFixedWidth(260)
+        ctrl_layout = QVBoxLayout(ctrl_panel)
+
+        # 控制按钮组
+        btn_frame = QFrame()
+        btn_frame.setFrameShape(QFrame.Box)
+        btn_layout = QVBoxLayout(btn_frame)
+        btn_layout.addWidget(QLabel("── 仿真控制 ──"))
+
+        row1 = QHBoxLayout()
+        self.start_btn = QPushButton("开始")
+        self.pause_btn = QPushButton("暂停")
+        row1.addWidget(self.start_btn)
+        row1.addWidget(self.pause_btn)
+        btn_layout.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        self.stop_btn  = QPushButton("停止")
+        self.reset_btn = QPushButton("重置")
+        row2.addWidget(self.stop_btn)
+        row2.addWidget(self.reset_btn)
+        btn_layout.addLayout(row2)
+
+        self.pause_btn.setEnabled(False)
+        self.stop_btn.setEnabled(False)
+        self.reset_btn.setEnabled(False)
+
+        self.start_btn.clicked.connect(self.start_simulation)
+        self.pause_btn.clicked.connect(self.pause_simulation)
+        self.stop_btn.clicked.connect(self.stop_simulation)
+        self.reset_btn.clicked.connect(self.reset_simulation)
+
+        # 参数组
+        param_frame = QFrame()
+        param_frame.setFrameShape(QFrame.Box)
+        param_layout = QVBoxLayout(param_frame)
+        param_layout.addWidget(QLabel("── 仿真参数 ──"))
+
+        def param_row(label, widget):
+            row = QHBoxLayout()
+            row.addWidget(QLabel(label))
+            row.addWidget(widget)
+            param_layout.addLayout(row)
+
+        self.steps_edit      = QLineEdit("60")
         self.path_mode_combo = QComboBox()
         self.path_mode_combo.addItems(["最短时间", "最短距离", "多目标优化", "最少区域切换"])
-        self.path_mode_layout.addWidget(self.path_mode_combo)
-        self.params_group_layout.addLayout(self.path_mode_layout)
-        
-        # 站点规模
-        self.station_size_layout = QHBoxLayout()
-        self.station_size_layout.addWidget(QLabel("站点规模:"))
         self.station_size_combo = QComboBox()
         self.station_size_combo.addItems(["小型站", "中型站", "大型站"])
-        self.station_size_layout.addWidget(self.station_size_combo)
-        self.params_group_layout.addLayout(self.station_size_layout)
-        
-        # 运营时间段
-        self.operation_time_layout = QHBoxLayout()
-        self.operation_time_layout.addWidget(QLabel("运营时间段:"))
-        self.operation_time_edit = QLineEdit("7-9,17-19")
-        self.operation_time_edit.setToolTip("格式: 开始1-结束1,开始2-结束2")
-        self.operation_time_layout.addWidget(self.operation_time_edit)
-        self.params_group_layout.addLayout(self.operation_time_layout)
-        
+        self.start_hour_combo = QComboBox()
+        self.start_hour_combo.addItems([f"{h:02d}:00" for h in range(6, 24)])
+        self.start_hour_combo.setCurrentIndex(0)   # 默认 06:00
+
+        param_row("时长 (分钟):", self.steps_edit)
+        param_row("起始时间:",    self.start_hour_combo)
+        param_row("路径模式:",    self.path_mode_combo)
+        param_row("站点规模:",    self.station_size_combo)
+
+        # 时段流量配置
+        self._period_rules = None
+        self._period_config_btn = QPushButton("配置时段流量...")
+        self._period_config_btn.clicked.connect(self._open_period_config)
+        self._period_summary_label = QLabel("未配置（全程平常期）")
+        self._period_summary_label.setStyleSheet("color: #666; font-size: 8pt;")
+        param_layout.addWidget(self._period_config_btn)
+        param_layout.addWidget(self._period_summary_label)
+
         # 进度条
         self.progress_bar = QProgressBar()
-        self.progress_bar.setValue(0)
-        self.params_group_layout.addWidget(self.progress_bar)
-        
-        # 添加到控制面板
-        self.control_layout.addWidget(self.control_group)
-        self.control_layout.addWidget(self.params_group)
-        self.control_layout.addStretch()
-        
-        # 创建右侧主显示区域
-        self.main_display = QWidget()
-        self.main_display_layout = QVBoxLayout(self.main_display)
-        
-        # 选项卡
+        self.progress_bar.setTextVisible(False)
+        self.progress_label = QLabel("00:00 / 00:00")
+        self.progress_label.setAlignment(Qt.AlignCenter)
+        self.progress_label.setFont(QFont("Arial", 9))
+        param_layout.addWidget(self.progress_bar)
+        param_layout.addWidget(self.progress_label)
+
+        ctrl_layout.addWidget(btn_frame)
+        ctrl_layout.addWidget(param_frame)
+        ctrl_layout.addStretch()
+
+        # 右侧主显示
         self.tab_widget = QTabWidget()
-        
-        # 拓扑图选项卡
-        self.topology_tab = QWidget()
-        self.topology_layout = QVBoxLayout(self.topology_tab)
-        self.topology_view = TopologyView()
-        self.topology_layout.addWidget(self.topology_view)
-        self.tab_widget.addTab(self.topology_tab, "拓扑图")
-        
-        # 热力图选项卡
-        self.heatmap_tab = QWidget()
-        self.heatmap_layout = QVBoxLayout(self.heatmap_tab)
-        self.heatmap_view = HeatmapView()
-        self.heatmap_layout.addWidget(self.heatmap_view)
-        self.tab_widget.addTab(self.heatmap_tab, "热力图")
-        
-        # 实时数据选项卡
-        self.realtime_tab = QWidget()
-        self.realtime_layout = QVBoxLayout(self.realtime_tab)
-        self.realtime_view = RealtimeDataView()
-        self.realtime_layout.addWidget(self.realtime_view)
-        self.tab_widget.addTab(self.realtime_tab, "实时数据")
-        
-        # 分析报告选项卡
-        self.analytics_tab = QWidget()
-        self.analytics_layout = QVBoxLayout(self.analytics_tab)
+
+        self.topology_view  = TopologyView()
+        self.heatmap_view   = HeatmapView()
+        self.realtime_view  = RealtimeDataView()
         self.analytics_view = AnalyticsView()
-        self.analytics_layout.addWidget(self.analytics_view)
-        self.tab_widget.addTab(self.analytics_tab, "分析报告")
-        
-        self.main_display_layout.addWidget(self.tab_widget)
-        
-        # 添加到主布局
-        self.main_layout.addWidget(self.control_panel, 1)
-        self.main_layout.addWidget(self.main_display, 4)
-        
-        # 创建状态栏
+
+        self.tab_widget.addTab(self.topology_view,  "拓扑图")
+        self.tab_widget.addTab(self.heatmap_view,   "热力图")
+        self.tab_widget.addTab(self.realtime_view,  "实时数据")
+        self.tab_widget.addTab(self.analytics_view, "分析报告")
+
+        main_layout.addWidget(ctrl_panel)
+        main_layout.addWidget(self.tab_widget, 1)
+
+        # 状态栏
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("就绪")
-    
+        self.status_bar.showMessage("就绪 — 可在拓扑图中添加/编辑节点后开始仿真")
+
+
+    ##  仿真控制
     def start_simulation(self):
-        """开始仿真"""
-        # 更新状态
-        self.status_bar.showMessage("运行中")
-        self.start_button.setEnabled(False)
-        self.pause_button.setEnabled(True)
-        self.stop_button.setEnabled(True)
-        self.reset_button.setEnabled(True)
-        
-        # 获取站点规模和运营时间段
-        station_size = self.station_size_combo.currentText()
-        operation_time = self.operation_time_edit.text()
-        
-        # 获取拓扑图视图中的图结构
+        self.status_bar.showMessage("运行中...")
+        self.start_btn.setEnabled(False)
+        self.pause_btn.setEnabled(True)
+        self.stop_btn.setEnabled(True)
+        self.reset_btn.setEnabled(True)
+
+        duration_min = max(1, int(self.steps_edit.text() or 60))
+        steps = duration_min * 60   # 1分钟=60步=60秒
+        self._sim_start_hour = self.start_hour_combo.currentIndex() + 6
+
         graph = self.topology_view.get_graph()
-        
-        # 创建仿真系统
-        self.simulation = SubwaySimulation(station_size=station_size, operation_time=operation_time, custom_graph=graph)
-        
-        # 获取仿真步数
-        steps = int(self.steps_edit.text())
+        self.simulation = SubwaySimulation(
+            station_size   = self.station_size_combo.currentText(),
+            operation_time = "",
+            custom_graph   = graph,
+            total_steps    = steps,
+            period_rules   = self._period_rules,
+            start_hour     = self._sim_start_hour,
+        )
+
         self.progress_bar.setRange(0, steps)
         self.progress_bar.setValue(0)
-        
-        # 启动仿真线程
+        start_h = self._sim_start_hour
+        self.progress_label.setText(f"{start_h:02d}:00 / {start_h:02d}:00")
+
+        self.realtime_view.reset()
+        self.realtime_view.set_start_hour(self._sim_start_hour)
+        self.realtime_view.set_total_steps(steps)
+
         self.simulation_thread = SimulationThread(self.simulation, steps)
-        self.simulation_thread.update_signal.connect(self.update_simulation)
-        self.simulation_thread.finished_signal.connect(self.simulation_finished)
+        self.simulation_thread.update_signal.connect(self._on_update)
+        self.simulation_thread.finished_signal.connect(self._on_finished)
         self.simulation_thread.start()
-    
+
+    def _open_period_config(self):
+        dlg = PeriodConfigDialog(self._period_rules, self)
+        if dlg.exec_() == QDialog.Accepted:
+            self._period_rules = dlg.get_rules()
+            self._period_summary_label.setText(
+                PeriodConfigDialog.rules_summary(self._period_rules))
+
     def pause_simulation(self):
-        """暂停仿真"""
-        if self.simulation_thread:
-            if self.simulation_thread.paused:
-                self.simulation_thread.resume()
-                self.status_bar.showMessage("运行中")
-                self.pause_button.setText("暂停仿真")
-            else:
-                self.simulation_thread.pause()
-                self.status_bar.showMessage("暂停")
-                self.pause_button.setText("继续仿真")
-    
+        if not self.simulation_thread:
+            return
+        if self.simulation_thread.paused:
+            self.simulation_thread.resume()
+            self.pause_btn.setText("暂停")
+            self.status_bar.showMessage("运行中...")
+        else:
+            self.simulation_thread.pause()
+            self.pause_btn.setText("继续")
+            self.status_bar.showMessage("已暂停")
+
     def stop_simulation(self):
-        """停止仿真"""
         if self.simulation_thread:
             self.simulation_thread.stop()
             self.simulation_thread.wait()
-        
-        self.status_bar.showMessage("已停止")
-        self.start_button.setEnabled(True)
-        self.pause_button.setEnabled(False)
-        self.pause_button.setText("暂停仿真")
-        self.stop_button.setEnabled(False)
-        self.reset_button.setEnabled(True)
-        
-        # 生成分析报告
-        self.generate_report()
-    
+        self._set_stopped_state()
+        self._generate_report()
+
     def reset_simulation(self):
-        """重置仿真"""
         if self.simulation_thread:
             self.simulation_thread.stop()
             self.simulation_thread.wait()
-        
-        self.status_bar.showMessage("就绪")
-        self.simulation = None
+        self.simulation        = None
         self.simulation_thread = None
-        self.start_button.setEnabled(True)
-        self.pause_button.setEnabled(False)
-        self.pause_button.setText("暂停仿真")
-        self.stop_button.setEnabled(False)
-        self.reset_button.setEnabled(False)
         self.progress_bar.setValue(0)
-        
-        # 重置可视化
+        self.progress_label.setText("00:00 / 00:00")
+        self.start_btn.setEnabled(True)
+        self.pause_btn.setEnabled(False)
+        self.stop_btn.setEnabled(False)
+        self.reset_btn.setEnabled(False)
         self.topology_view.reset()
         self.heatmap_view.reset()
         self.realtime_view.reset()
         self.analytics_view.reset()
-    
-    def update_simulation(self, step, passenger_count, densities, avg_density=0, max_queue=0):
-        """更新仿真状态"""
-        # 更新进度条
+        self.status_bar.showMessage("已重置")
+
+    def _set_stopped_state(self):
+        self.start_btn.setEnabled(True)
+        self.pause_btn.setEnabled(False)
+        self.pause_btn.setText("暂停")
+        self.stop_btn.setEnabled(False)
+        self.reset_btn.setEnabled(True)
+        self.status_bar.showMessage("已停止")
+
+
+    ##  仿真回调
+    def _on_update(self, step, passenger_count, densities, avg_density, max_queue):
+        total = self.progress_bar.maximum()
         self.progress_bar.setValue(step)
-        self.status_bar.showMessage(f"运行中 - 步数: {step}/{self.progress_bar.maximum()}")
-        
-        # 更新拓扑图
-        if self.simulation:
-            graph = self.simulation.station_graph.get_graph()
-            passengers = self.simulation.simulation.get_passengers()
-            self.topology_view.update_view(graph, passengers)
-            
-            # 更新热力图
-            self.heatmap_view.update_view(graph, densities)
-            
-            # 更新实时数据
-            self.realtime_view.update_data(step, passenger_count, avg_density, max_queue)
-            
-            # 更新拓扑图视图的拥堵状态
-            congestion_data = {}
-            for node_id, density in densities.items():
-                congestion_data[node_id] = density
-            self.topology_view.update_congestion(congestion_data)
-    
-    def simulation_finished(self):
-        """仿真结束"""
-        self.status_bar.showMessage("已完成")
-        self.start_button.setEnabled(True)
-        self.pause_button.setEnabled(False)
-        self.pause_button.setText("暂停仿真")
-        self.stop_button.setEnabled(False)
-        self.reset_button.setEnabled(True)
-        
-        # 生成分析报告
-        self.generate_report()
-    
-    def generate_report(self):
-        """生成分析报告"""
+        # 进度显示为时钟时间
+        start_sec = getattr(self, '_sim_start_hour', 6) * 3600
+        cur_sec  = start_sec + step
+        end_sec  = start_sec + total
+        def _fmt(s):
+            h = (s // 3600) % 24
+            m = (s % 3600) // 60
+            return f"{h:02d}:{m:02d}"
+        self.progress_label.setText(f"{_fmt(cur_sec)} / {_fmt(end_sec)}")
+        self.status_bar.showMessage(
+            f"运行中 — {_fmt(cur_sec)}  乘客: {passenger_count}  平均密度: {avg_density:.3f}"
+        )
+        if not self.simulation:
+            return
+
+        graph      = self.simulation.station_graph.get_graph()
+        passengers = self.simulation.simulation.get_passengers()
+
+        self.topology_view.update_view(graph, passengers)
+        self.topology_view.update_congestion(densities)
+        self.heatmap_view.update_view(graph, densities)
+        self.realtime_view.update_data(step, passenger_count, avg_density, max_queue)
+
+    def _on_finished(self):
+        self._set_stopped_state()
+        self.status_bar.showMessage("仿真完成")
+        self._generate_report()
+
+    def _generate_report(self):
         if self.simulation:
             report = self.simulation.generate_analytics()
             self.analytics_view.update_report(report)
-            # 生成热力图
-            self.simulation.analytics.plot_heatmap()
+            self.tab_widget.setCurrentIndex(3)   # 自动跳到分析报告
 
-class SubwaySimulation:
-    """地铁站人流仿真系统"""
-    
-    def __init__(self, station_size="中型站", operation_time="7-9,17-19", custom_graph=None):
-        """初始化仿真系统
-        
-        Args:
-            station_size: 站点规模 (小型站, 中型站, 大型站)
-            operation_time: 运营时间段，格式: "开始1-结束1,开始2-结束2"
-            custom_graph: 自定义图结构
-        """
-        # 创建地铁站图
-        self.station_size = station_size
-        self.operation_time = operation_time
-        self.peak_hours = self._parse_operation_time(operation_time)
-        
-        # 使用自定义图结构或创建默认图
-        if custom_graph:
-            self.station_graph = custom_graph
-        else:
-            self.station_graph = self._create_station_graph()
-        
-        # 创建路径规划器
-        self.path_planner = PathPlanner(self.station_graph)
-        # 创建仿真引擎
-        self.simulation = SimulationEngine(self.station_graph, self.path_planner, self.peak_hours)
-        # 创建分析模块
-        self.analytics = AnalyticsModule(self.station_graph)
-    
-    def _parse_operation_time(self, operation_time):
-        """解析运营时间段
-        
-        Args:
-            operation_time: 运营时间段字符串
-        
-        Returns:
-            list: 高峰期时间段列表 [(start1, end1), (start2, end2), ...]
-        """
-        peak_hours = []
-        try:
-            periods = operation_time.split(',')
-            for period in periods:
-                start_end = period.split('-')
-                if len(start_end) == 2:
-                    start = int(start_end[0].strip())
-                    end = int(start_end[1].strip())
-                    peak_hours.append((start, end))
-        except:
-            # 默认高峰期
-            peak_hours = [(7, 9), (17, 19)]
-        return peak_hours
-    
-    def _create_station_graph(self):
-        """创建地铁站拓扑图"""
-        graph = StationGraph()
-        
-        # 根据站点规模调整参数
-        if self.station_size == "小型站":
-            entrance_capacity = 30
-            ticket_capacity = 20
-            security_capacity = 15
-            gate_capacity = 10
-            corridor_capacity = 80
-            platform_capacity = 150
-            exit_capacity = 30
-            node_count = 1
-        elif self.station_size == "中型站":
-            entrance_capacity = 50
-            ticket_capacity = 30
-            security_capacity = 20
-            gate_capacity = 15
-            corridor_capacity = 100
-            platform_capacity = 200
-            exit_capacity = 50
-            node_count = 2
-        else:  # 大型站
-            entrance_capacity = 80
-            ticket_capacity = 50
-            security_capacity = 30
-            gate_capacity = 25
-            corridor_capacity = 150
-            platform_capacity = 300
-            exit_capacity = 80
-            node_count = 3
-        
-        # 添加节点
-        # 入口
-        for i in range(1, node_count + 1):
-            graph.add_node(f'entrance{i}', 'entrance', entrance_capacity, 0, 5 * i, area=100.0, base_speed=1.0)
-        
-        # 售票区
-        for i in range(1, node_count + 1):
-            graph.add_node(f'ticket{i}', 'ticket', ticket_capacity, 5, 5 * i, area=80.0, base_speed=0.8)
-        
-        # 安检区
-        for i in range(1, node_count + 1):
-            graph.add_node(f'security{i}', 'security', security_capacity, 10, 5 * i, area=60.0, base_speed=0.6)
-        
-        # 闸机区
-        for i in range(1, node_count + 1):
-            graph.add_node(f'gate{i}', 'gate', gate_capacity, 15, 5 * i, area=40.0, base_speed=1.0)
-        
-        # 通道
-        graph.add_node('corridor1', 'corridor', corridor_capacity, 20, 10, area=200.0, base_speed=1.2)
-        
-        # 楼梯/扶梯
-        for i in range(1, node_count + 1):
-            graph.add_node(f'stairs{i}', 'stairs', 10, 25, 5 * i, area=30.0, base_speed=0.5)
-            graph.add_node(f'escalator{i}', 'escalator', 20, 25, 5 * i + 2.5, area=50.0, base_speed=0.8)
-        
-        # 站台
-        for i in range(1, node_count + 1):
-            graph.add_node(f'platform{i}', 'platform', platform_capacity, 30, 5 * i, area=400.0, base_speed=1.0)
-        
-        # 出口
-        for i in range(1, node_count + 1):
-            graph.add_node(f'exit{i}', 'exit', exit_capacity, 35, 5 * i, area=100.0, base_speed=1.0)
-        
-        # 添加边
-        # 入口到售票区
-        for i in range(1, node_count + 1):
-            graph.add_edge(f'entrance{i}', f'ticket{i}', 5, 2, capacity=10, base_time=1.0)
-        
-        # 售票区到安检区
-        for i in range(1, node_count + 1):
-            graph.add_edge(f'ticket{i}', f'security{i}', 5, 2, capacity=8, base_time=1.0)
-        
-        # 安检区到闸机区
-        for i in range(1, node_count + 1):
-            graph.add_edge(f'security{i}', f'gate{i}', 5, 2, capacity=5, base_time=1.0)
-        
-        # 闸机区到通道
-        for i in range(1, node_count + 1):
-            graph.add_edge(f'gate{i}', 'corridor1', 5, 3, capacity=15, base_time=1.0)
-        
-        # 通道到楼梯/扶梯
-        for i in range(1, node_count + 1):
-            graph.add_edge('corridor1', f'stairs{i}', 5, 2, capacity=8, base_time=1.0)
-            graph.add_edge('corridor1', f'escalator{i}', 5, 3, capacity=12, base_time=1.0)
-        
-        # 楼梯/扶梯到站台
-        for i in range(1, node_count + 1):
-            graph.add_edge(f'stairs{i}', f'platform{i}', 10, 2, capacity=6, base_time=2.0)
-            graph.add_edge(f'escalator{i}', f'platform{i}', 10, 3, capacity=10, base_time=1.5)
-        
-        # 站台到出口
-        for i in range(1, node_count + 1):
-            graph.add_edge(f'platform{i}', f'exit{i}', 5, 2, capacity=10, base_time=1.0)
-        
-        return graph
-    
-    def run_simulation_step(self):
-        """运行一个仿真步骤"""
-        self.simulation.step()
-    
-    def generate_analytics(self):
-        """生成分析报告"""
-        # 收集数据
-        passengers = self.simulation.get_passengers()
-        densities = {}
-        for node in self.station_graph.get_graph().nodes():
-            node_info = self.station_graph.get_node(node)
-            if node_info:
-                densities[node] = node_info.get('current_density', 0)
-        
-        self.analytics.record_data(self.simulation.get_current_time(), passengers, densities)
-        
-        # 生成报告
-        return self.analytics.generate_report()
 
+
+##  入口
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    # 设置应用程序字体
-    font = QFont("SimHei", 9)
-    app.setFont(font)
+    app.setFont(_get_qt_chinese_font(9))
+    import os
+
+    _icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
+    app.setWindowIcon(QIcon(_icon_path))
+
     window = SubwaySimulationGUI()
     window.show()
     sys.exit(app.exec_())
