@@ -177,12 +177,51 @@ class Passenger:
 
         # 获取当前节点信息
         node_info = simulation.station_graph.get_node(current)
+        next_info = simulation.station_graph.get_node(next_node)
         density = node_info.get('current_density', 0.0) if node_info else 0.0
         base_speed = node_info.get('base_speed', 1.0) if node_info else 1.0
 
         # 速度因子（基于密度）
         speed_factor = self._get_speed_factor(density)
-        v_eff = min(self.speed * speed_factor, base_speed)
+
+        # ── 楼梯/扶梯速度差异化 ──
+        cur_type = node_info.get('type', '') if node_info else ''
+        next_type = next_info.get('type', '') if next_info else ''
+        cur_floor = node_info.get('floor', 0) if node_info else 0
+        next_floor = next_info.get('floor', 0) if next_info else 0
+        going_up = next_floor > cur_floor
+        going_down = next_floor < cur_floor
+
+        stair_escalator_factor = 1.0
+        # 楼梯：上楼慢（0.5），下楼稍快（0.7）
+        if cur_type == 'stairs' or next_type == 'stairs':
+            if going_up:
+                stair_escalator_factor = 0.5
+            elif going_down:
+                stair_escalator_factor = 0.7
+            else:
+                stair_escalator_factor = 0.6
+        # 扶梯：速度较均匀，但上行比下行略慢
+        elif cur_type == 'escalator' or next_type == 'escalator':
+            if going_up:
+                stair_escalator_factor = 0.8
+            elif going_down:
+                stair_escalator_factor = 0.9
+            else:
+                stair_escalator_factor = 0.85
+
+        # ── 对向冲突减速 ──
+        counter_flow_factor = 1.0
+        reverse_count = simulation._edge_directional_count.get((next_node, current), 0)
+        if reverse_count > 0:
+            forward_count = simulation._edge_directional_count.get((current, next_node), 0)
+            if forward_count > 0:
+                # 对向比例越高，减速越明显
+                ratio = reverse_count / (forward_count + reverse_count)
+                counter_flow_factor = max(0.4, 1.0 - ratio * 0.6)
+
+        v_eff = min(self.speed * speed_factor * stair_escalator_factor
+                    * counter_flow_factor, base_speed)
 
         # 移动进度增量
         distance = edge.get('distance', 1.0)
