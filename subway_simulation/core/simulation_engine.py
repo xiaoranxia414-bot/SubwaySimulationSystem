@@ -86,6 +86,21 @@ class SimulationEngine:
         # 基础到达率
         self.base_arrival_rate = 2.0
 
+        # ── 新增：成团到达 ──
+        self._group_events: List[Dict] = []       # 预设的团体到达事件
+        self._group_cooldown = 0                    # 成团到达冷却计时
+
+        # ── 新增：动态速率调整 ──
+        self._rate_multiplier = 1.0                 # 动态到达率乘数
+        self._congestion_history: deque = deque(maxlen=60)  # 近60步平均拥堵
+
+        # ── 新增：紧急疏散模式 ──
+        self.evacuation_mode = False
+        self._evacuation_start_time = None
+
+        # ── 新增：双向流 / 对向冲突跟踪 ──
+        self._edge_directional_count: Dict[tuple, int] = {}  # (u,v) → 该方向人数
+
     def _init_trains(self):
         """初始化列车"""
         platforms = self.station_graph.get_nodes_by_type('platform')
@@ -121,22 +136,32 @@ class SimulationEngine:
 
     def step(self) -> bool:
         """执行一个仿真步（1秒）"""
+        # 紧急疏散检查
+        if self.evacuation_mode:
+            self._handle_evacuation()
+
         self._generate_passengers()
         self._update_trains()
         self._process_queues()
         self._process_boarding()
 
-        # 统计节点和边人数
+        # 统计节点和边人数（含方向性）
         self._count_passengers()
 
         # 更新乘客状态和位置
         self._update_passengers()
+
+        # 双向流对向冲突检测
+        self._handle_counter_flow_conflicts()
 
         # 冲突检测
         self._handle_conflicts()
 
         # 更新密度和拥堵
         self._update_densities()
+
+        # 动态调整生成速率
+        self._dynamic_rate_adjustment()
 
         # 收集统计
         self._collect_stats()
@@ -182,11 +207,61 @@ class SimulationEngine:
         return float(max(rate, 0.1))
 
     def _generate_passengers(self):
-        rate = self._arrival_rate()
+        # 紧急疏散时停止生成新乘客
+        if self.evacuation_mode:
+            return
+
+        rate = self._arrival_rate() * self._rate_multiplier
+
+        # ── 成团到达（大型活动散场等）──
+        # 检查是否有预设的团体到达事件
+        for event in self._group_events:
+            if event['time'] == self.current_time:
+                group_size = event.get('size', 30)
+                entry_node = event.get('entry_node', None)
+                self._spawn_group(group_size, entry_node)
+
+        # 随机成团到达：每 300~600 秒有小概率出现一次 10~50 人的团体
+        if self._group_cooldown <= 0:
+            if random.random() < 0.003:  # 约每 333 秒触发一次
+                group_size = random.randint(10, 50)
+                self._spawn_group(group_size)
+                self._group_cooldown = random.randint(300, 600)
+        else:
+            self._group_cooldown -= 1
+
+        # 正常泊松到达
         new_passengers = self.passenger_generator.generate_passengers(
             self.current_time, rate)
         for p in new_passengers:
             self.add_passenger(p)
+
+    def _spawn_group(self, size: int, entry_node: str = None):
+        """生成一个团体（集中到达同一入口）"""
+        entry_nodes = self.station_graph.get_nodes_by_type('entrance')
+        if not entry_nodes:
+            return
+        # 团体集中从同一个入口进入
+        chosen_entry = entry_node if entry_node and entry_node in entry_nodes \
+            else random.choice(entry_nodes)
+
+        for _ in range(size):
+            p = self.passenger_generator.generate_passenger(self.current_time)
+            if p:
+                p.start_node = chosen_entry
+                p.current_node = chosen_entry
+                # 团体成员速度较慢（人群效应）
+                p.speed *= random.uniform(0.7, 0.9)
+                self.add_passenger(p)
+
+    def schedule_group_arrival(self, time_step: int, size: int = 30,
+                               entry_node: str = None):
+        """预设一个团体到达事件（供 GUI 调用）"""
+        self._group_events.append({
+            'time': time_step,
+            'size': size,
+            'entry_node': entry_node,
+        })
 
     # ── 列车系统 ──────────────────────────────
 
@@ -310,9 +385,10 @@ class SimulationEngine:
     # ── 乘客更新 ──────────────────────────────
 
     def _count_passengers(self):
-        """统计各节点和边上的乘客数量"""
+        """统计各节点和边上的乘客数量（含方向性统计）"""
         self.node_passenger_count.clear()
         self.edge_passenger_count.clear()
+        self._edge_directional_count.clear()
 
         for p in self.passengers:
             self.node_passenger_count[p.current_node] = \
@@ -323,6 +399,9 @@ class SimulationEngine:
                 v = p.path[p.path_index + 1]
                 self.edge_passenger_count[(u, v)] = \
                     self.edge_passenger_count.get((u, v), 0) + 1
+                # 方向性统计
+                self._edge_directional_count[(u, v)] = \
+                    self._edge_directional_count.get((u, v), 0) + 1
 
     def _update_passengers(self):
         """更新所有乘客状态"""
@@ -403,7 +482,154 @@ class SimulationEngine:
 
         self.stats_collector.next_step()
 
-    # ── 查询接口 ──────────────────────────────
+    # ── 双向流 / 对向冲突 ──────────────────────────────
+
+    def _handle_counter_flow_conflicts(self):
+        """检测双向流冲突并施加速度惩罚
+
+        如果同一条通道 (u,v) 和 (v,u) 同时有人流，
+        两个方向的乘客都会因对向冲突而减速。
+        """
+        processed = set()
+        for (u, v), count_uv in self._edge_directional_count.items():
+            if (u, v) in processed or (v, u) in processed:
+                continue
+            count_vu = self._edge_directional_count.get((v, u), 0)
+            if count_uv > 0 and count_vu > 0:
+                # 存在对向流，计算冲突系数
+                total = count_uv + count_vu
+                # 冲突系数：双向越均衡冲突越大（最大2.0）
+                balance = min(count_uv, count_vu) / max(count_uv, count_vu)
+                conflict_factor = 1.0 + balance * 1.0  # 1.0 ~ 2.0
+
+                # 提高边的拥堵系数
+                edge_data = self.station_graph.get_edge(u, v)
+                if edge_data:
+                    old_cf = edge_data.get('congestion_factor', 1.0)
+                    new_cf = max(old_cf, conflict_factor)
+                    self.station_graph.update_edge_congestion(u, v, new_cf)
+                edge_data_rev = self.station_graph.get_edge(v, u)
+                if edge_data_rev:
+                    old_cf = edge_data_rev.get('congestion_factor', 1.0)
+                    new_cf = max(old_cf, conflict_factor)
+                    self.station_graph.update_edge_congestion(v, u, new_cf)
+
+            processed.add((u, v))
+            processed.add((v, u))
+
+    # ── 动态到达率调整 ──────────────────────────────
+
+    def _dynamic_rate_adjustment(self):
+        """根据当前系统拥堵程度动态调整乘客到达率
+
+        如果系统过于拥挤（平均密度超过阈值），降低到达率，
+        模拟现实中车站限流、引导措施。
+        """
+        if not self.node_passenger_count:
+            return
+
+        # 计算当前系统平均密度
+        total_density = 0
+        count = 0
+        for node_id, pcount in self.node_passenger_count.items():
+            node_info = self.station_graph.get_node(node_id)
+            if node_info:
+                area = node_info.get('area', 100.0)
+                total_density += pcount / area
+                count += 1
+
+        avg_density = total_density / max(count, 1)
+        self._congestion_history.append(avg_density)
+
+        # 基于滑动平均拥堵调整乘数
+        if len(self._congestion_history) >= 10:
+            rolling_avg = sum(self._congestion_history) / len(self._congestion_history)
+            if rolling_avg > 2.0:
+                # 严重拥堵：大幅降低到达率（限流）
+                self._rate_multiplier = max(0.3, self._rate_multiplier - 0.02)
+            elif rolling_avg > 1.0:
+                # 中度拥堵：轻微降低
+                self._rate_multiplier = max(0.5, self._rate_multiplier - 0.005)
+            elif rolling_avg < 0.3:
+                # 空闲：恢复正常
+                self._rate_multiplier = min(1.0, self._rate_multiplier + 0.01)
+            else:
+                # 正常：缓慢恢复
+                self._rate_multiplier = min(1.0, self._rate_multiplier + 0.005)
+
+    # ── 紧急疏散模式 ──────────────────────────────
+
+    def activate_evacuation(self):
+        """激活紧急疏散模式"""
+        self.evacuation_mode = True
+        self._evacuation_start_time = self.current_time
+
+        # 1. 清空所有路径缓存
+        self.path_planner.clear_cache()
+
+        # 2. 所有乘客重新规划到最近出口
+        exits = self.station_graph.get_nodes_by_type('exit')
+        if not exits:
+            return
+
+        for p in self.passengers:
+            # 跳过已在出站过程中的乘客
+            if p.current_state == p.STATE_EXITING:
+                continue
+
+            # 停止乘车/候车状态，立即疏散
+            p.current_state = p.STATE_EXITING
+            p.wait_time = 0
+
+            # 选择最近的出口
+            best_exit = None
+            best_dist = float('inf')
+            cur_info = self.station_graph.get_node(p.current_node)
+            if not cur_info:
+                continue
+            cx, cy = cur_info['x'], cur_info['y']
+            for ex in exits:
+                ex_info = self.station_graph.get_node(ex)
+                if ex_info:
+                    dist = ((cx - ex_info['x'])**2 + (cy - ex_info['y'])**2) ** 0.5
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_exit = ex
+
+            if best_exit:
+                p.end_node = best_exit
+                new_path = self.path_planner.find_path(
+                    p.current_node, best_exit, 'shortest_time')
+                if new_path and len(new_path) > 1:
+                    p.set_path(new_path)
+
+        # 3. 提高移动速度（紧急状态人群速度提升）
+        for p in self.passengers:
+            p.speed *= 1.3
+
+    def deactivate_evacuation(self):
+        """解除紧急疏散模式"""
+        self.evacuation_mode = False
+        self._evacuation_start_time = None
+
+    def _handle_evacuation(self):
+        """疏散模式下的每步处理"""
+        # 疏散模式下清空服务队列（不再排队）
+        for node_id in list(self.queues.keys()):
+            queue = self.queues[node_id]
+            for p in list(queue):
+                if p.current_state in (p.STATE_TICKET, p.STATE_SECURITY, p.STATE_GATE):
+                    p.current_state = p.STATE_EXITING
+                    p.wait_time = 0
+            queue.clear()
+
+        # 疏散模式下候车乘客也立即出站
+        for p in list(self.passengers):
+            if p.current_state in (p.STATE_WAITING, p.STATE_RIDING,
+                                    p.STATE_BOARDING, p.STATE_TICKET,
+                                    p.STATE_SECURITY, p.STATE_GATE):
+                p.current_state = p.STATE_EXITING
+                p.wait_time = 0
 
     def get_stats(self):
         return {
@@ -444,4 +670,11 @@ class SimulationEngine:
         self.edge_passenger_count.clear()
         self.finished_wait_times.clear()
         self.finished_travel_times.clear()
+        self._edge_directional_count.clear()
+        self._group_events.clear()
+        self._group_cooldown = 0
+        self._rate_multiplier = 1.0
+        self._congestion_history.clear()
+        self.evacuation_mode = False
+        self._evacuation_start_time = None
         self._init_trains()
