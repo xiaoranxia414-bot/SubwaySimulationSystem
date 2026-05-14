@@ -5,10 +5,11 @@ from PyQt5.QtWidgets import (
     QTableWidget, QTableWidgetItem, QGridLayout, QGraphicsScene,
     QGraphicsView, QGraphicsEllipseItem, QGraphicsLineItem, QDialog,
     QFormLayout, QDoubleSpinBox, QSpinBox, QMessageBox, QGraphicsTextItem,
-    QScrollArea, QDialogButtonBox, QSlider
+    QScrollArea, QDialogButtonBox, QSlider, QGraphicsPixmapItem
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QPointF, QRectF
-from PyQt5.QtGui import QFont, QColor, QPainter, QPen, QBrush, QCursor, QIcon
+from PyQt5.QtGui import QFont, QColor, QPainter, QPen, QBrush, QCursor, QIcon, QPixmap
+
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
@@ -29,6 +30,7 @@ plt.rcParams['font.sans-serif'] = [_chosen_font]
 plt.rcParams['axes.unicode_minus'] = False
 
 import networkx as nx
+import os
 import sys
 import time
 from core import StationGraph, SimulationEngine, PathPlanner, AnalyticsModule
@@ -110,12 +112,55 @@ class SimulationThread(QThread):
         self.paused = False
 
 
+##  PNG 图标映射与加载
+
+_ICON_MAP = {
+    'entrance':  '入口.png',
+    'exit':      '出口.png',
+    'security':  'UI_icon2_安检1.png',
+    'ticket':    '售票处.png',
+    'gate':      '闸机.png',
+    'platform':  '站台门.png',
+    'corridor':  '走廊应急.png',
+    'stairs':    '楼梯.png',
+    'escalator': '电扶梯专业.png',
+}
+
+# 图标缓存，避免重复加载
+_ICON_CACHE = {}
+
+
+def _load_icon_pixmap(node_type, size=26):
+    """加载节点类型对应的PNG图标，返回QPixmap"""
+    cache_key = (node_type, size)
+    if cache_key in _ICON_CACHE:
+        return _ICON_CACHE[cache_key]
+
+    png_name = _ICON_MAP.get(node_type)
+    if not png_name:
+        return None
+    icon_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'icons')
+    png_path = os.path.join(icon_dir, png_name)
+    if not os.path.exists(png_path):
+        return None
+
+    pixmap = QPixmap(png_path)
+    if pixmap.isNull():
+        return None
+    # 缩放到目标尺寸
+    if pixmap.width() != size or pixmap.height() != size:
+        pixmap = pixmap.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+    _ICON_CACHE[cache_key] = pixmap
+    return pixmap
+
+
 ##  节点图形项
 
 class NodeItem(QGraphicsEllipseItem):
-    """节点图形项（支持拖拽时连线跟随）"""
+    """节点图形项（支持拖拽时连线跟随，叠加SVG图标）"""
 
-    NODE_RADIUS = 12  # 节点半径，统一管理
+    NODE_RADIUS = 14  # 节点半径，统一管理
 
     def __init__(self, node_id, node_type, x, y,
                  capacity=50, area=100.0, base_speed=1.0, floor=0, parent=None):
@@ -154,6 +199,14 @@ class NodeItem(QGraphicsEllipseItem):
         font = QFont("Arial", 7)
         font.setBold(True)
         self.floor_text.setFont(font)
+
+        # PNG 图标叠加（居中显示）
+        self.icon_item = None
+        icon_pixmap = _load_icon_pixmap(node_type, size=int(NodeItem.NODE_RADIUS * 1.8))
+        if icon_pixmap:
+            self.icon_item = QGraphicsPixmapItem(icon_pixmap, self)
+            self.icon_item.setOffset(-icon_pixmap.width() / 2, -icon_pixmap.height() / 2)
+            self.icon_item.setZValue(3)
 
         # 拥堵高亮边框
         self._congestion_pen = QPen(QColor('red'), 3)
@@ -211,6 +264,12 @@ class NodeItem(QGraphicsEllipseItem):
             self.setPen(self._congestion_pen)
         else:
             self.setPen(self._base_pen)
+        # 确保图标和标签始终在最上层
+        if self.icon_item:
+            self.icon_item.setZValue(3)
+        self.count_text.setZValue(4)
+        self.id_text.setZValue(4)
+        self.floor_text.setZValue(4)
 
     # 乘客人数
     def update_passenger_count(self, count):
