@@ -75,7 +75,7 @@ class PathPlanner:
             return []
 
     def _time_weight(self, u, v, d):
-        """时间权重 = 基础时间 × 拥堵系数 + 距离/速度"""
+        """时间权重 = 基础时间 × 拥堵系数 + 距离/速度 + 跨层代价"""
         base_time = d.get('base_time', 1.0)
         congestion = d.get('congestion_factor', 1.0)
         distance = d.get('distance', 1.0)
@@ -83,7 +83,30 @@ class PathPlanner:
         # 通行时间 = max(基础时间, 距离/(宽度修正速度))
         speed = 1.0 * min(2.0, width / 2.0)  # 宽度越宽，速度上限越高
         travel_time = distance / max(speed, 0.1)
-        return base_time * congestion + travel_time
+
+        # ── 跨层代价（楼梯/扶梯上下行差异）──
+        floor_penalty = 0.0
+        u_node = self.station_graph.get_node(u)
+        v_node = self.station_graph.get_node(v)
+        if u_node and v_node:
+            u_floor = u_node.get('floor', 0)
+            v_floor = v_node.get('floor', 0)
+            floor_diff = abs(v_floor - u_floor)
+            if floor_diff > 0:
+                u_type = u_node.get('type', '')
+                v_type = v_node.get('type', '')
+                going_up = v_floor > u_floor
+                # 楼梯：上楼慢（8s/层），下楼较快（5s/层）
+                if u_type == 'stairs' or v_type == 'stairs':
+                    floor_penalty = floor_diff * (8.0 if going_up else 5.0)
+                # 扶梯：速度较均匀，上行4s/层，下行3s/层
+                elif u_type == 'escalator' or v_type == 'escalator':
+                    floor_penalty = floor_diff * (4.0 if going_up else 3.0)
+                # 其他跨层（直梯等）：统一 6s/层
+                else:
+                    floor_penalty = floor_diff * 6.0
+
+        return base_time * congestion + travel_time + floor_penalty
 
     def _congestion_weight(self, u, v, d):
         """拥堵权重：优先选择拥堵系数小的边"""
