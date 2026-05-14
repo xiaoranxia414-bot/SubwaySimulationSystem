@@ -9,7 +9,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QPointF, QRectF
 from PyQt5.QtGui import QFont, QColor, QPainter, QPen, QBrush, QCursor, QIcon, QPixmap
-
+from PyQt5.QtSvg import QSvgRenderer
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
@@ -30,10 +30,54 @@ plt.rcParams['font.sans-serif'] = [_chosen_font]
 plt.rcParams['axes.unicode_minus'] = False
 
 import networkx as nx
-import os
 import sys
+import os
 import time
 from core import StationGraph, SimulationEngine, PathPlanner, AnalyticsModule
+
+
+# ── SVG 图标加载 ──────────────────────────────
+# 节点类型 → SVG 文件名映射
+_ICON_FILE_MAP = {
+    'entrance':  '入口.svg',
+    'exit':      '出口.svg',
+    'security':  '安检.svg',
+    'ticket':    '售票处.svg',
+    'gate':      '闸机.svg',
+    'platform':  '站台.svg',
+    'corridor':  '走廊.svg',
+    'stairs':    '楼梯.svg',
+    'escalator': '电扶梯专业.svg',
+}
+
+_ICON_PIXMAP_CACHE: dict = {}   # node_type -> QPixmap (缓存，避免重复渲染)
+
+def _get_icon_dir():
+    """图标目录：脚本同级的 icons/ 文件夹"""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'icons')
+
+def _load_node_icon(node_type: str, size: int = 28) -> 'QPixmap':
+    """加载节点类型对应的 SVG 图标，返回 QPixmap；缓存结果"""
+    cache_key = (node_type, size)
+    if cache_key in _ICON_PIXMAP_CACHE:
+        return _ICON_PIXMAP_CACHE[cache_key]
+
+    filename = _ICON_FILE_MAP.get(node_type)
+    if filename:
+        path = os.path.join(_get_icon_dir(), filename)
+        if os.path.exists(path):
+            renderer = QSvgRenderer(path)
+            pixmap = QPixmap(size, size)
+            pixmap.fill(Qt.transparent)
+            painter = QPainter(pixmap)
+            renderer.render(painter)
+            painter.end()
+            _ICON_PIXMAP_CACHE[cache_key] = pixmap
+            return pixmap
+
+    # 回退：返回空 pixmap
+    _ICON_PIXMAP_CACHE[cache_key] = QPixmap()
+    return _ICON_PIXMAP_CACHE[cache_key]
 
 
 def _get_qt_chinese_font(size=9) -> "QFont":
@@ -112,55 +156,13 @@ class SimulationThread(QThread):
         self.paused = False
 
 
-##  PNG 图标映射与加载
-
-_ICON_MAP = {
-    'entrance':  '入口.png',
-    'exit':      '出口.png',
-    'security':  'UI_icon2_安检1.png',
-    'ticket':    '售票处.png',
-    'gate':      '闸机.png',
-    'platform':  '站台门.png',
-    'corridor':  '走廊应急.png',
-    'stairs':    '楼梯.png',
-    'escalator': '电扶梯专业.png',
-}
-
-# 图标缓存，避免重复加载
-_ICON_CACHE = {}
-
-
-def _load_icon_pixmap(node_type, size=26):
-    """加载节点类型对应的PNG图标，返回QPixmap"""
-    cache_key = (node_type, size)
-    if cache_key in _ICON_CACHE:
-        return _ICON_CACHE[cache_key]
-
-    png_name = _ICON_MAP.get(node_type)
-    if not png_name:
-        return None
-    icon_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'icons')
-    png_path = os.path.join(icon_dir, png_name)
-    if not os.path.exists(png_path):
-        return None
-
-    pixmap = QPixmap(png_path)
-    if pixmap.isNull():
-        return None
-    # 缩放到目标尺寸
-    if pixmap.width() != size or pixmap.height() != size:
-        pixmap = pixmap.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-
-    _ICON_CACHE[cache_key] = pixmap
-    return pixmap
-
-
 ##  节点图形项
 
 class NodeItem(QGraphicsEllipseItem):
-    """节点图形项（支持拖拽时连线跟随，叠加SVG图标）"""
+    """节点图形项（支持拖拽时连线跟随，优先显示 SVG 图标）"""
 
-    NODE_RADIUS = 14  # 节点半径，统一管理
+    NODE_RADIUS = 16  # 节点半径（稍大以适配图标）
+    ICON_SIZE   = 28  # SVG 图标渲染尺寸
 
     def __init__(self, node_id, node_type, x, y,
                  capacity=50, area=100.0, base_speed=1.0, floor=0, parent=None):
@@ -174,7 +176,21 @@ class NodeItem(QGraphicsEllipseItem):
         self.base_speed = base_speed
         self.floor      = floor
         self.setPos(x, y)
-        self.setBrush(self._get_brush())
+
+        # 尝试加载 SVG 图标
+        self._icon_item = None
+        icon_pixmap = _load_node_icon(node_type, self.ICON_SIZE)
+        if not icon_pixmap.isNull():
+            # 有图标：椭圆透明，仅用于交互碰撞区域
+            self.setBrush(QBrush(Qt.transparent))
+            self.setPen(QPen(Qt.transparent))
+            self._icon_item = QGraphicsPixmapItem(icon_pixmap, self)
+            self._icon_item.setOffset(-self.ICON_SIZE / 2, -self.ICON_SIZE / 2)
+            self._icon_item.setZValue(1)
+        else:
+            # 无图标：回退到原来的彩色圆
+            self.setBrush(self._get_brush())
+
         self._apply_floor_style()
 
         # 关键：开启位置变化通知，itemChange 才会触发
@@ -189,7 +205,7 @@ class NodeItem(QGraphicsEllipseItem):
 
         # 人数标签
         self.count_text = QGraphicsTextItem("0人", self)
-        self.count_text.setPos(-r, r + 2)
+        self.count_text.setPos(-r, r + 4)
         self.count_text.setDefaultTextColor(QColor('#333333'))
 
         # 楼层标签（右下方）
@@ -200,18 +216,10 @@ class NodeItem(QGraphicsEllipseItem):
         font.setBold(True)
         self.floor_text.setFont(font)
 
-        # PNG 图标叠加（居中显示）
-        self.icon_item = None
-        icon_pixmap = _load_icon_pixmap(node_type, size=int(NodeItem.NODE_RADIUS * 1.8))
-        if icon_pixmap:
-            self.icon_item = QGraphicsPixmapItem(icon_pixmap, self)
-            self.icon_item.setOffset(-icon_pixmap.width() / 2, -icon_pixmap.height() / 2)
-            self.icon_item.setZValue(3)
-
         # 拥堵高亮边框
         self._congestion_pen = QPen(QColor('red'), 3)
 
-    # 颜色
+    # 颜色（回退用 / 图例用）
     _COLOR_MAP = {
         'entrance':  '#27ae60',
         'exit':      '#e74c3c',
@@ -233,43 +241,62 @@ class NodeItem(QGraphicsEllipseItem):
             return "F0"
 
     def _apply_floor_style(self):
-        """根据楼层设置边框样式"""
+        """根据楼层设置边框样式（仅在无图标回退模式下可见）"""
         if self.floor < 0:
-            # 地下层：蓝色虚线
             self._base_pen = QPen(QColor('#2980b9'), 2, Qt.DashLine)
         elif self.floor == 0:
-            # 地面层：黑色实线
             self._base_pen = QPen(QColor('black'), 2, Qt.SolidLine)
         elif self.floor == 1:
-            # 站厅层：橙色实线
             self._base_pen = QPen(QColor('#e67e22'), 2, Qt.SolidLine)
         else:
-            # 更高层：紫色实线
             self._base_pen = QPen(QColor('#8e44ad'), 2, Qt.SolidLine)
-        self.setPen(self._base_pen)
+        # 有图标时不显示椭圆边框
+        if self._icon_item is None:
+            self.setPen(self._base_pen)
 
     def _get_brush(self):
         color = self._COLOR_MAP.get(self.node_type, '#ffffff')
         return QBrush(QColor(color))
 
-    #拥堵渐变
+    def update_icon(self):
+        """节点类型变更后重新加载图标"""
+        icon_pixmap = _load_node_icon(self.node_type, self.ICON_SIZE)
+        if not icon_pixmap.isNull():
+            if self._icon_item is None:
+                self._icon_item = QGraphicsPixmapItem(icon_pixmap, self)
+                self._icon_item.setOffset(-self.ICON_SIZE / 2, -self.ICON_SIZE / 2)
+                self._icon_item.setZValue(1)
+            else:
+                self._icon_item.setPixmap(icon_pixmap)
+            self.setBrush(QBrush(Qt.transparent))
+            self.setPen(QPen(Qt.transparent))
+        else:
+            if self._icon_item:
+                self.scene().removeItem(self._icon_item) if self.scene() else None
+                self._icon_item = None
+            self.setBrush(self._get_brush())
+            self._apply_floor_style()
+
+    # 拥堵渐变
     def update_congestion(self, congestion):
         """congestion: 0~1 浮点，越大越红"""
-        base = QColor(self._COLOR_MAP.get(self.node_type, '#ffffff'))
-        r = min(255, base.red()   + int(congestion * 80))
-        g = max(0,   base.green() - int(congestion * 80))
-        b = max(0,   base.blue()  - int(congestion * 80))
-        self.setBrush(QBrush(QColor(r, g, b)))
-        if congestion > 0.6:
-            self.setPen(self._congestion_pen)
+        if self._icon_item is not None:
+            # 有图标模式：拥堵时显示红色边框圈
+            if congestion > 0.6:
+                self.setPen(self._congestion_pen)
+            else:
+                self.setPen(QPen(Qt.transparent))
         else:
-            self.setPen(self._base_pen)
-        # 确保图标和标签始终在最上层
-        if self.icon_item:
-            self.icon_item.setZValue(3)
-        self.count_text.setZValue(4)
-        self.id_text.setZValue(4)
-        self.floor_text.setZValue(4)
+            # 回退彩色圆模式
+            base = QColor(self._COLOR_MAP.get(self.node_type, '#ffffff'))
+            r = min(255, base.red()   + int(congestion * 80))
+            g = max(0,   base.green() - int(congestion * 80))
+            b = max(0,   base.blue()  - int(congestion * 80))
+            self.setBrush(QBrush(QColor(r, g, b)))
+            if congestion > 0.6:
+                self.setPen(self._congestion_pen)
+            else:
+                self.setPen(self._base_pen)
 
     # 乘客人数
     def update_passenger_count(self, count):
@@ -575,23 +602,10 @@ class TopologyView(QWidget):
         self.add_edge_btn = QPushButton("添加边")
         self.delete_btn   = QPushButton("删除选中")
 
-        # 图例标签
-        legend_label = QLabel()
-        legend_label.setText(
-            '<span style="color:#27ae60">■入口</span> '
-            '<span style="color:#e74c3c">■出口</span> '
-            '<span style="color:#f39c12">■安检</span> '
-            '<span style="color:#2980b9">■售票</span> '
-            '<span style="color:#e67e22">■闸机</span> '
-            '<span style="color:#8e44ad">■站台</span> '
-            '<span style="color:#7f8c8d">■通道</span>'
-        )
-
         toolbar.addWidget(self.add_node_btn)
         toolbar.addWidget(self.add_edge_btn)
         toolbar.addWidget(self.delete_btn)
         toolbar.addStretch()
-        toolbar.addWidget(legend_label)
         main_layout.addLayout(toolbar)
 
         # 画布
@@ -602,8 +616,25 @@ class TopologyView(QWidget):
         self.view.setRenderHint(QPainter.Antialiasing, True)
         self.view.setRenderHint(QPainter.SmoothPixmapTransform, True)
         self.view.setDragMode(QGraphicsView.RubberBandDrag)
+        # 不固定 sceneRect，改为随视图尺寸动态更新
         self.view.setSceneRect(0, 0, 900, 620)
         main_layout.addWidget(self.view)
+
+        # 覆盖 resizeEvent：窗口变大时背景图随之铺满，不留白
+        _topo_self = self
+        _orig_resize = self.view.__class__.resizeEvent
+        def _view_resize(ev):
+            _orig_resize(self.view, ev)
+            w = self.view.viewport().width()
+            h = self.view.viewport().height()
+            # 让 sceneRect 至少覆盖视口
+            old = self.view.sceneRect()
+            new_w = max(old.width(),  w)
+            new_h = max(old.height(), h)
+            self.view.setSceneRect(0, 0, new_w, new_h)
+            _topo_self._stretch_background()
+        self.view.resizeEvent = _view_resize
+
 
         # 状态
         self.add_node_mode = False   # 添加节点模式
@@ -611,7 +642,11 @@ class TopologyView(QWidget):
         self.start_node    = None    # 添加边时记录起点
         self.temp_edge     = None    # 预览虚线
 
-        # 数据映射
+        # 背景图状态（透明度硬编码 50%）
+        self._bg_item: QGraphicsPixmapItem = None
+        self._bg_path: str = None
+        self._bg_opacity: float = 0.50
+        self._bg_original_pixmap: QPixmap = None
         self.node_items: dict[str, NodeItem] = {}
         self.edge_items: dict[tuple, EdgeItem] = {}
 
@@ -841,10 +876,10 @@ class TopologyView(QWidget):
                 item.id_text.setPlainText(new_id)
                 self.node_items[new_id] = item
 
-            # 更新类型和颜色
+            # 更新类型和图标
             if new_type != item.node_type:
                 item.node_type = new_type
-                item.setBrush(item._get_brush())
+                item.update_icon()
 
 
     ##  仿真数据更新
@@ -870,9 +905,53 @@ class TopologyView(QWidget):
             cf = (congestion_data.get(f, 0) + congestion_data.get(t, 0)) / (2 * max_val + 1e-6)
             edge_item.update_congestion(1.0 + cf * 2)
 
+    # ── 背景图（硬编码 50% 透明度，自动加载 image.png）──────────────────────────────
+
+    def _load_background_image(self, path: str):
+        """加载背景图片（仅接受路径，透明度固定 50%）"""
+        if not path:
+            return
+        pixmap = QPixmap(path)
+        if pixmap.isNull():
+            return
+        self._bg_path = path
+        self._bg_original_pixmap = pixmap
+        self._apply_background_pixmap(pixmap)
+
+    def _apply_background_pixmap(self, pixmap: QPixmap):
+        """将 pixmap 缩放到当前视口尺寸并设为背景（最底层）"""
+        if self._bg_item and self._bg_item.scene():
+            self.scene.removeItem(self._bg_item)
+            self._bg_item = None
+
+        vw = max(self.view.viewport().width(),  900)
+        vh = max(self.view.viewport().height(), 620)
+
+        scaled = pixmap.scaled(
+            vw, vh,
+            Qt.IgnoreAspectRatio,
+            Qt.SmoothTransformation
+        )
+
+        self._bg_item = QGraphicsPixmapItem(scaled)
+        self._bg_item.setPos(0, 0)
+        self._bg_item.setZValue(-100)
+        self._bg_item.setOpacity(self._bg_opacity)   # 硬编码 0.50
+        self.scene.addItem(self._bg_item)
+        self.view.setSceneRect(0, 0, vw, vh)
+
+    def _stretch_background(self):
+        """窗口 resize 时重新拉伸背景图铺满新尺寸"""
+        if not getattr(self, '_bg_original_pixmap', None):
+            return
+        self._apply_background_pixmap(self._bg_original_pixmap)
+
     def reset(self):
         """重置画布，恢复默认拓扑"""
         self.scene.clear()
+        self._bg_item             = None
+        self._bg_original_pixmap  = None
+        self._bg_path             = None
         self.node_items.clear()
         self.edge_items.clear()
         self._load_default_topology()
@@ -957,6 +1036,14 @@ class TopologyView(QWidget):
             connect(f'stairs{i}',    f'platform{i}')
             connect(f'escalator{i}', f'platform{i}')
             connect(f'platform{i}',  f'exit{i}')
+
+        # 自动加载同目录下的 image.png 作为背景（若存在）
+        if self._bg_path is None:
+            default_bg = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), 'image.png')
+            if os.path.exists(default_bg):
+                self._bg_path = default_bg
+                self._load_background_image(default_bg)
 
 
 
@@ -1351,7 +1438,25 @@ class TrajectoryPlaybackView(QWidget):
 
         # ── 拓扑图显示（复用 TopologyView）──
         self.topology_view = TopologyView()
-        # 回放模式下禁用节点拖拽和编辑
+        # 回放模式下：隐藏编辑工具栏按钮，禁止增删节点和边
+        self.topology_view.add_node_btn.hide()
+        self.topology_view.add_edge_btn.hide()
+        self.topology_view.delete_btn.hide()
+        # 禁用所有编辑模式标志
+        self.topology_view.add_node_mode = False
+        self.topology_view.add_edge_mode = False
+        # 覆盖鼠标事件，禁止双击添加节点、Delete键删除等编辑操作
+        self.topology_view.view.mouseDoubleClickEvent = lambda e: None
+        self.topology_view.view.keyPressEvent = lambda e: None
+        # 替换鼠标点击：只允许普通视图交互（平移/框选），不允许添加节点/边
+        def _readonly_mouse_press(event):
+            QGraphicsView.mousePressEvent(self.topology_view.view, event)
+        self.topology_view.view.mousePressEvent = _readonly_mouse_press
+        # 禁止切换到添加模式（即使通过代码调用）
+        self.topology_view.toggle_add_node_mode = lambda: None
+        self.topology_view.toggle_add_edge_mode = lambda: None
+        self.topology_view.delete_selected = lambda: None
+        # 禁用已有节点的拖拽和选中
         for item in self.topology_view.scene.items():
             if isinstance(item, NodeItem):
                 item.setFlag(QGraphicsEllipseItem.ItemIsMovable, False)
@@ -1454,6 +1559,239 @@ class TrajectoryPlaybackView(QWidget):
         self.slider.setValue(0)
         self.step_label.setText("Step: 0 / 0")
         self.topology_view.reset()
+
+
+##  3D 立体视图
+class ThreeDView(QWidget):
+    """3D 立体车站视图 — 基于 matplotlib Axes3D，支持鼠标旋转/缩放
+
+    将节点的 (x, y, floor) 映射为三维坐标 (x, y, floor × LAYER_HEIGHT)，
+    不同楼层在不同高度平面上渲染，楼梯/扶梯边用竖向线段连接。
+    仿真运行时节点颜色随密度变化。
+    """
+
+    LAYER_HEIGHT = 60  # 每层楼的 Z 方向间距
+
+    # 节点类型 → 颜色映射
+    _TYPE_COLOR = {
+        'entrance':  '#27ae60',
+        'exit':      '#e74c3c',
+        'security':  '#f39c12',
+        'ticket':    '#2980b9',
+        'gate':      '#e67e22',
+        'platform':  '#8e44ad',
+        'corridor':  '#7f8c8d',
+        'stairs':    '#795548',
+        'escalator': '#f48fb1',
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+
+        # 提示栏
+        hint = QLabel("🖱 左键拖拽旋转  ·  右键拖拽缩放  ·  仿真运行时自动刷新密度")
+        hint.setStyleSheet("color: #888; font-size: 8pt;")
+        layout.addWidget(hint)
+
+        # matplotlib 3D 画布
+        self.fig = Figure(figsize=(8, 6), dpi=100)
+        self.canvas = FigureCanvas(self.fig)
+        layout.addWidget(self.canvas, 1)
+
+        self._graph = None
+        self._densities = {}
+        self._draw_placeholder()
+
+    def _draw_placeholder(self):
+        self.fig.clear()
+        ax = self.fig.add_subplot(111)
+        ax.set_facecolor('#f8f9fa')
+        ax.text(0.5, 0.5, "开始仿真后显示 3D 立体视图",
+                ha='center', va='center', fontsize=14, color='#7f8c8d')
+        ax.axis('off')
+        self.canvas.draw()
+
+    def set_graph(self, graph):
+        """设置拓扑图（NetworkX DiGraph）"""
+        self._graph = graph
+        self._render()
+
+    def update_densities(self, densities: dict):
+        """仿真运行时更新节点密度"""
+        self._densities = densities
+        if self._graph:
+            self._render()
+
+    def _compute_3d_positions(self, graph):
+        """根据节点面积计算 3D 坐标，使站点间距与面积成比例
+
+        思路：按同层节点的拓扑排列顺序，沿 X 轴依次排布，
+        相邻节点间距 = sqrt(前一个节点面积) * 缩放系数，
+        同层多条线路沿 Y 轴偏移。
+        """
+        import math
+
+        SPACING_SCALE = 1.8   # 面积→间距缩放系数
+        Y_LINE_STEP   = 40    # 多条线路之间的 Y 间距
+
+        # 按楼层分组
+        floor_nodes = {}
+        for node_id, data in graph.nodes(data=True):
+            fl = data.get('floor', 0)
+            floor_nodes.setdefault(fl, []).append((node_id, data))
+
+        positions = {}  # node_id -> (x, y, z)
+
+        for fl, node_list in floor_nodes.items():
+            z = fl * self.LAYER_HEIGHT
+            # 按原始 x 坐标排序（保持拓扑流程顺序）
+            node_list.sort(key=lambda nd: nd[1].get('x', 0))
+
+            # 按 y 坐标分"线路"组
+            y_groups = {}
+            for nid, data in node_list:
+                orig_y = data.get('y', 0)
+                # 量化到组（同一线路的 y 差异 < 50 归为一组）
+                assigned = False
+                for gy in y_groups:
+                    if abs(orig_y - gy) < 50:
+                        y_groups[gy].append((nid, data))
+                        assigned = True
+                        break
+                if not assigned:
+                    y_groups[orig_y] = [(nid, data)]
+
+            sorted_groups = sorted(y_groups.keys())
+            for gi, gy in enumerate(sorted_groups):
+                group = y_groups[gy]
+                group.sort(key=lambda nd: nd[1].get('x', 0))
+                cum_x = 0
+                y_pos = gi * Y_LINE_STEP
+                for nid, data in group:
+                    area = data.get('area', 100.0)
+                    positions[nid] = (cum_x, y_pos, z)
+                    cum_x += math.sqrt(area) * SPACING_SCALE
+
+        return positions
+
+    def _render(self):
+        """渲染 3D 视图"""
+        if not self._graph:
+            return
+
+        from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+        self.fig.clear()
+        ax = self.fig.add_subplot(111, projection='3d')
+        ax.set_facecolor('#f0f4f8')
+
+        graph = self._graph
+
+        # 使用面积换算坐标
+        pos3d = self._compute_3d_positions(graph)
+
+        nodes_data = {}
+        for node_id, data in graph.nodes(data=True):
+            if node_id in pos3d:
+                x, y, z = pos3d[node_id]
+                nodes_data[node_id] = (x, y, z, data)
+
+        if not nodes_data:
+            self.canvas.draw()
+            return
+
+        # ── 绘制边 ──
+        for u, v in graph.edges():
+            if u in nodes_data and v in nodes_data:
+                x1, y1, z1, _ = nodes_data[u]
+                x2, y2, z2, _ = nodes_data[v]
+                # 跨层边用虚线高亮
+                if z1 != z2:
+                    ax.plot([x1, x2], [y1, y2], [z1, z2],
+                            color='#e67e22', linewidth=2.5,
+                            linestyle='--', alpha=0.8)
+                else:
+                    ax.plot([x1, x2], [y1, y2], [z1, z2],
+                            color='#aab4be', linewidth=1.2, alpha=0.6)
+
+        # ── 绘制节点 ──
+        max_density = max(self._densities.values()) if self._densities else 1.0
+        max_density = max(max_density, 0.001)
+
+        for node_id, (x, y, z, data) in nodes_data.items():
+            ntype = data.get('type', 'corridor')
+            density = self._densities.get(node_id, 0)
+
+            # 颜色：无密度数据时使用类型色，有密度时从绿→黄→红渐变
+            if self._densities:
+                ratio = min(1.0, density / max_density)
+                r = min(255, int(50 + 200 * ratio))
+                g = max(0,   int(200 - 150 * ratio))
+                b = 50
+                color = f'#{r:02x}{g:02x}{b:02x}'
+            else:
+                color = self._TYPE_COLOR.get(ntype, '#7f8c8d')
+
+            size = 80 + density * 40
+            ax.scatter([x], [y], [z], c=color, s=size,
+                       alpha=0.9, edgecolors='#333', linewidths=0.8,
+                       depthshade=True, zorder=5)
+            # 字体调大：6 → 10
+            ax.text(x, y, z + 5, node_id, fontsize=10,
+                    ha='center', va='bottom', color='#222', zorder=6)
+
+        # ── 楼层参考平面 ──
+        floors = set()
+        for _, (_, _, z, data) in nodes_data.items():
+            floors.add((data.get('floor', 0), z))
+
+        floor_names = {0: '地面层 F0', 1: '站厅层 F1', -1: '站台层 B1'}
+        all_x = [nd[0] for nd in nodes_data.values()]
+        all_y = [nd[1] for nd in nodes_data.values()]
+        x_min, x_max = min(all_x) - 30, max(all_x) + 30
+        y_min, y_max = min(all_y) - 30, max(all_y) + 30
+
+        for floor_num, z_val in sorted(floors):
+            # 半透明参考平面
+            xx = [x_min, x_max, x_max, x_min]
+            yy = [y_min, y_min, y_max, y_max]
+            zz = [z_val, z_val, z_val, z_val]
+            from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+            verts = [list(zip(xx, yy, zz))]
+            plane = Poly3DCollection(verts, alpha=0.08,
+                                     facecolor='#3498db', edgecolor='#bbb',
+                                     linewidths=0.5)
+            ax.add_collection3d(plane)
+            # 楼层标签 — 字体调大：9 → 13
+            label = floor_names.get(floor_num, f'F{floor_num}')
+            ax.text(x_min - 10, y_min - 10, z_val, label,
+                    fontsize=13, color='#2c3e50', fontweight='bold')
+
+        # 隐藏 X / Y 轴刻度数值（坐标是内部换算值，对用户无意义）
+        ax.set_xticklabels([])
+        ax.set_yticklabels([])
+        ax.set_xlabel('')
+        ax.set_ylabel('')
+        ax.set_zlabel('楼层', fontsize=13, labelpad=8)
+        # 标题字体调大：12 → 16
+        ax.set_title('3D 车站立体结构', fontsize=16, fontweight='bold', pad=12)
+
+        # 设置初始视角（俯视偏斜）
+        ax.view_init(elev=25, azim=-60)
+        # Z轴刻度字体调大：7 → 11
+        ax.tick_params(axis='z', labelsize=11)
+        ax.tick_params(axis='x', labelsize=0)
+        ax.tick_params(axis='y', labelsize=0)
+
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+    def reset(self):
+        self._graph = None
+        self._densities = {}
+        self._draw_placeholder()
 
 
 ##  仿真业务层
@@ -1667,9 +2005,11 @@ class SubwaySimulationGUI(QMainWindow):
         self.realtime_view   = RealtimeDataView()
         self.analytics_view  = AnalyticsView()
         self.trajectory_view = TrajectoryPlaybackView()
+        self.threed_view     = ThreeDView()
 
         self.tab_widget.addTab(self.topology_view,   "拓扑图")
         self.tab_widget.addTab(self.heatmap_view,    "热力图")
+        self.tab_widget.addTab(self.threed_view,     "3D视图")
         self.tab_widget.addTab(self.realtime_view,   "实时数据")
         self.tab_widget.addTab(self.analytics_view,  "分析报告")
         self.tab_widget.addTab(self.trajectory_view, "轨迹回放")
@@ -1771,6 +2111,7 @@ class SubwaySimulationGUI(QMainWindow):
         self.realtime_view.reset()
         self.analytics_view.reset()
         self.trajectory_view.reset()
+        self.threed_view.reset()
         self.status_bar.showMessage("已重置")
 
     def _set_stopped_state(self):
@@ -1839,6 +2180,13 @@ class SubwaySimulationGUI(QMainWindow):
         self.heatmap_view.update_view(graph, densities)
         self.realtime_view.update_data(step, passenger_count, avg_density, max_queue)
 
+        # 3D 视图：首次设置拓扑，后续仅更新密度
+        if not self.threed_view._graph:
+            self.threed_view.set_graph(graph)
+        # 仅当3D标签页可见时才刷新（避免性能浪费）
+        if self.tab_widget.currentWidget() is self.threed_view:
+            self.threed_view.update_densities(densities)
+
     def _on_finished(self, history):
         """仿真结束：停止UI定时器，加载轨迹回放数据"""
         self.ui_timer.stop()
@@ -1849,6 +2197,14 @@ class SubwaySimulationGUI(QMainWindow):
             graph = self.simulation.station_graph.get_graph() if self.simulation else None
             if graph:
                 self.trajectory_view.set_graph(graph)
+                # 同步最终密度到 3D 视图
+                densities = {}
+                for node in graph.nodes():
+                    node_info = self.simulation.station_graph.get_node(node)
+                    if node_info:
+                        densities[node] = node_info.get('current_density', 0)
+                self.threed_view.set_graph(graph)
+                self.threed_view.update_densities(densities)
             self.trajectory_view.set_history(history)
         self._generate_report()
 
@@ -1856,7 +2212,7 @@ class SubwaySimulationGUI(QMainWindow):
         if self.simulation:
             report = self.simulation.generate_analytics()
             self.analytics_view.update_report(report)
-            self.tab_widget.setCurrentIndex(3)   # 自动跳到分析报告
+            self.tab_widget.setCurrentIndex(4)   # 自动跳到分析报告（3D视图插入后索引+1）
 
 
 
@@ -1864,7 +2220,6 @@ class SubwaySimulationGUI(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setFont(_get_qt_chinese_font(9))
-    import os
 
     _icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
     app.setWindowIcon(QIcon(_icon_path))
