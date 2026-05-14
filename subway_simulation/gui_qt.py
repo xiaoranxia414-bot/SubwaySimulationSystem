@@ -52,58 +52,52 @@ def _get_qt_chinese_font(size=9) -> "QFont":
 ##  仿真线程
 
 class SimulationThread(QThread):
-    """仿真线程"""
-    update_signal = pyqtSignal(int, int, dict, float, int)
-    finished_signal = pyqtSignal()
+    """仿真线程（UI与仿真解耦：仿真全速运行，UI由独立QTimer刷新）"""
+    finished_signal = pyqtSignal(list)
 
-    def __init__(self, simulation, steps, update_interval=5):
+    def __init__(self, simulation, steps):
         super().__init__()
         self.simulation = simulation
         self.steps = steps
         self.running = True
         self.paused = False
-        self.update_interval = update_interval  # 每N步更新一次UI
+        self.current_step = 0
+        self.history = []          # 轨迹回放历史数据
+
+    def _record_snapshot(self):
+        """记录当前仿真状态快照（用于轨迹回放）"""
+        passengers = self.simulation.simulation.get_passengers()
+        densities = {}
+        node_counts = {}
+        for node in self.simulation.station_graph.get_graph().nodes():
+            node_info = self.simulation.station_graph.get_node(node)
+            if node_info:
+                densities[node] = node_info.get('current_density', 0)
+            node_counts[node] = sum(1 for p in passengers if p.current_node == node)
+        self.history.append({
+            'step': self.current_step,
+            'passenger_count': len(passengers),
+            'densities': densities.copy(),
+            'node_counts': node_counts.copy(),
+        })
 
     def run(self):
         for i in range(self.steps):
             if not self.running:
                 break
             while self.paused:
-                time.sleep(0.05)
+                time.sleep(0.01)
                 if not self.running:
                     break
             if not self.running:
                 break
 
             self.simulation.run_simulation_step()
+            self.current_step = i + 1
+            self._record_snapshot()
+            time.sleep(0.001)  # 让出时间片，避免阻塞UI线程
 
-            if (i + 1) % self.update_interval == 0 or i == self.steps - 1:
-                passenger_count = len(self.simulation.simulation.get_passengers())
-                densities = {}
-                total_density = 0
-                node_count = 0
-                max_queue = 0
-
-                for node in self.simulation.station_graph.get_graph().nodes():
-                    node_info = self.simulation.station_graph.get_node(node)
-                    if node_info:
-                        density = node_info.get('current_density', 0)
-                        densities[node] = density
-                        total_density += density
-                        node_count += 1
-
-                avg_density = total_density / node_count if node_count > 0 else 0
-
-                for node_id, queue in self.simulation.simulation.queues.items():
-                    queue_length = len(queue)
-                    if queue_length > max_queue:
-                        max_queue = queue_length
-
-                self.update_signal.emit(i + 1, passenger_count, densities, avg_density, max_queue)
-
-            time.sleep(0.02)  # 更快响应
-
-        self.finished_signal.emit()
+        self.finished_signal.emit(self.history)
 
     def pause(self):
         self.paused = True
@@ -1255,6 +1249,154 @@ class AnalyticsView(QWidget):
         self.text_edit.setPlainText("分析报告将在仿真结束后显示...")
 
 
+##  轨迹回放视图
+class TrajectoryPlaybackView(QWidget):
+    """实时轨迹回放：支持快进/慢放/暂停，回放仿真历史状态"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.history = []
+        self.current_idx = 0
+        self.playing = False
+        self.speed = 1.0
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._next_frame)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+
+        # ── 控制栏 ──
+        ctrl = QHBoxLayout()
+        self.play_btn = QPushButton("▶ 播放")
+        self.pause_btn = QPushButton("⏸ 暂停")
+        self.speed_combo = QComboBox()
+        self.speed_combo.addItems(["0.5x", "1x", "2x", "5x", "10x"])
+        self.speed_combo.setCurrentIndex(1)
+        self.step_label = QLabel("Step: 0 / 0")
+        self.step_label.setFont(QFont("Arial", 9))
+
+        ctrl.addWidget(self.play_btn)
+        ctrl.addWidget(self.pause_btn)
+        ctrl.addWidget(QLabel("速度:"))
+        ctrl.addWidget(self.speed_combo)
+        ctrl.addStretch()
+        ctrl.addWidget(self.step_label)
+        layout.addLayout(ctrl)
+
+        # ── 时间轴滑块 ──
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setMinimum(0)
+        self.slider.setMaximum(0)
+        self.slider.valueChanged.connect(self._on_slider_changed)
+        layout.addWidget(self.slider)
+
+        # ── 拓扑图显示（复用 TopologyView）──
+        self.topology_view = TopologyView()
+        # 回放模式下禁用节点拖拽和编辑
+        for item in self.topology_view.scene.items():
+            if isinstance(item, NodeItem):
+                item.setFlag(QGraphicsEllipseItem.ItemIsMovable, False)
+                item.setFlag(QGraphicsEllipseItem.ItemIsSelectable, False)
+        layout.addWidget(self.topology_view, 1)
+
+        self.play_btn.clicked.connect(self._play)
+        self.pause_btn.clicked.connect(self._pause)
+        self.speed_combo.currentTextChanged.connect(self._on_speed_changed)
+
+    def set_graph(self, graph):
+        """根据当前拓扑图重建回放视图"""
+        self.topology_view.scene.clear()
+        self.topology_view.node_items.clear()
+        self.topology_view.edge_items.clear()
+        for node_id, data in graph.nodes(data=True):
+            item = NodeItem(
+                node_id, data.get('type', 'corridor'),
+                data.get('x', 0), data.get('y', 0),
+                capacity=data.get('capacity', 50),
+                area=data.get('area', 100.0),
+                base_speed=data.get('base_speed', 1.0),
+                floor=data.get('floor', 0)
+            )
+            item.setFlag(QGraphicsEllipseItem.ItemIsMovable, False)
+            item.setFlag(QGraphicsEllipseItem.ItemIsSelectable, False)
+            self.topology_view.scene.addItem(item)
+            self.topology_view.node_items[node_id] = item
+        for u, v in graph.edges():
+            if u in self.topology_view.node_items and v in self.topology_view.node_items:
+                edge = EdgeItem(self.topology_view.node_items[u], self.topology_view.node_items[v])
+                self.topology_view.scene.addItem(edge)
+                self.topology_view.edge_items[(u, v)] = edge
+
+    def set_history(self, history):
+        self.history = history
+        self.slider.setMaximum(max(0, len(history) - 1))
+        self.current_idx = 0
+        self.slider.setValue(0)
+        self._update_frame()
+
+    def _play(self):
+        if not self.history:
+            return
+        self.playing = True
+        interval = max(20, int(100 / self.speed))
+        self._timer.start(interval)
+
+    def _pause(self):
+        self.playing = False
+        self._timer.stop()
+
+    def _next_frame(self):
+        if self.current_idx < len(self.history) - 1:
+            self.current_idx += 1
+            self.slider.setValue(self.current_idx)
+            self._update_frame()
+        else:
+            self._pause()
+
+    def _on_slider_changed(self, value):
+        self.current_idx = value
+        self._update_frame()
+
+    def _on_speed_changed(self, text):
+        self.speed = float(text.replace('x', ''))
+        if self.playing:
+            self._timer.stop()
+            interval = max(20, int(100 / self.speed))
+            self._timer.start(interval)
+
+    def _update_frame(self):
+        if not self.history or self.current_idx >= len(self.history):
+            return
+        data = self.history[self.current_idx]
+        total_step = self.history[-1]['step'] if self.history else 0
+        self.step_label.setText(f"Step: {data['step']} / {total_step}")
+
+        densities = data.get('densities', {})
+        node_counts = data.get('node_counts', {})
+        max_val = max(densities.values()) if densities else 1.0
+        max_val = max(max_val, 0.001)
+
+        for node_id, item in self.topology_view.node_items.items():
+            item.update_passenger_count(node_counts.get(node_id, 0))
+            val = densities.get(node_id, 0)
+            item.update_congestion(val / max_val)
+
+        # 边拥堵色同步更新
+        for (f, t), edge_item in self.topology_view.edge_items.items():
+            cf = (densities.get(f, 0) + densities.get(t, 0)) / (2 * max_val + 1e-6)
+            edge_item.update_congestion(1.0 + cf * 2)
+
+    def reset(self):
+        self.history = []
+        self.current_idx = 0
+        self.playing = False
+        self._timer.stop()
+        self.slider.setMaximum(0)
+        self.slider.setValue(0)
+        self.step_label.setText("Step: 0 / 0")
+        self.topology_view.reset()
+
+
 ##  仿真业务层
 class SubwaySimulation:
     """封装仿真引擎的业务类"""
@@ -1461,18 +1603,26 @@ class SubwaySimulationGUI(QMainWindow):
         # 右侧主显示
         self.tab_widget = QTabWidget()
 
-        self.topology_view  = TopologyView()
-        self.heatmap_view   = HeatmapView()
-        self.realtime_view  = RealtimeDataView()
-        self.analytics_view = AnalyticsView()
+        self.topology_view   = TopologyView()
+        self.heatmap_view    = HeatmapView()
+        self.realtime_view   = RealtimeDataView()
+        self.analytics_view  = AnalyticsView()
+        self.trajectory_view = TrajectoryPlaybackView()
 
-        self.tab_widget.addTab(self.topology_view,  "拓扑图")
-        self.tab_widget.addTab(self.heatmap_view,   "热力图")
-        self.tab_widget.addTab(self.realtime_view,  "实时数据")
-        self.tab_widget.addTab(self.analytics_view, "分析报告")
+        self.tab_widget.addTab(self.topology_view,   "拓扑图")
+        self.tab_widget.addTab(self.heatmap_view,    "热力图")
+        self.tab_widget.addTab(self.realtime_view,   "实时数据")
+        self.tab_widget.addTab(self.analytics_view,  "分析报告")
+        self.tab_widget.addTab(self.trajectory_view, "轨迹回放")
 
         main_layout.addWidget(ctrl_panel)
         main_layout.addWidget(self.tab_widget, 1)
+
+        # UI刷新定时器（15 FPS，仿真与UI解耦）
+        self.ui_timer = QTimer(self)
+        self.ui_timer.timeout.connect(self._on_ui_refresh)
+        self.ui_timer.setInterval(66)  # ~15 FPS
+        self._last_ui_step = 0
 
         # 状态栏
         self.status_bar = QStatusBar()
@@ -1512,9 +1662,10 @@ class SubwaySimulationGUI(QMainWindow):
         self.realtime_view.set_total_steps(steps)
 
         self.simulation_thread = SimulationThread(self.simulation, steps)
-        self.simulation_thread.update_signal.connect(self._on_update)
         self.simulation_thread.finished_signal.connect(self._on_finished)
         self.simulation_thread.start()
+        self.ui_timer.start()      # 启动独立UI刷新定时器
+        self._last_ui_step = 0
 
     def _open_period_config(self):
         dlg = PeriodConfigDialog(self._period_rules, self)
@@ -1536,6 +1687,7 @@ class SubwaySimulationGUI(QMainWindow):
             self.status_bar.showMessage("已暂停")
 
     def stop_simulation(self):
+        self.ui_timer.stop()
         if self.simulation_thread:
             self.simulation_thread.stop()
             self.simulation_thread.wait()
@@ -1543,6 +1695,7 @@ class SubwaySimulationGUI(QMainWindow):
         self._generate_report()
 
     def reset_simulation(self):
+        self.ui_timer.stop()
         if self.simulation_thread:
             self.simulation_thread.stop()
             self.simulation_thread.wait()
@@ -1558,6 +1711,7 @@ class SubwaySimulationGUI(QMainWindow):
         self.heatmap_view.reset()
         self.realtime_view.reset()
         self.analytics_view.reset()
+        self.trajectory_view.reset()
         self.status_bar.showMessage("已重置")
 
     def _set_stopped_state(self):
@@ -1569,11 +1723,41 @@ class SubwaySimulationGUI(QMainWindow):
         self.status_bar.showMessage("已停止")
 
 
-    ##  仿真回调
-    def _on_update(self, step, passenger_count, densities, avg_density, max_queue):
+    ##  UI与仿真线程分离：独立QTimer刷新界面
+    def _on_ui_refresh(self):
+        """由QTimer定时调用，从仿真引擎拉取当前状态刷新UI（~15 FPS）"""
+        if not self.simulation_thread or not self.simulation or not self.simulation_thread.running:
+            return
+        step = self.simulation_thread.current_step
+        if step == 0 or step == self._last_ui_step:
+            return
+        self._last_ui_step = step
+
+        # 从仿真引擎读取当前状态
+        passenger_count = len(self.simulation.simulation.get_passengers())
+        densities = {}
+        total_density = 0
+        node_count = 0
+        max_queue = 0
+        for node in self.simulation.station_graph.get_graph().nodes():
+            node_info = self.simulation.station_graph.get_node(node)
+            if node_info:
+                density = node_info.get('current_density', 0)
+                densities[node] = density
+                total_density += density
+                node_count += 1
+        avg_density = total_density / node_count if node_count > 0 else 0
+        for node_id, queue in self.simulation.simulation.queues.items():
+            queue_length = len(queue)
+            if queue_length > max_queue:
+                max_queue = queue_length
+
+        self._update_ui(step, passenger_count, densities, avg_density, max_queue)
+
+    def _update_ui(self, step, passenger_count, densities, avg_density, max_queue):
+        """统一UI刷新逻辑（进度条、拓扑图、热力图、实时数据）"""
         total = self.progress_bar.maximum()
         self.progress_bar.setValue(step)
-        # 进度显示为时钟时间
         start_sec = getattr(self, '_sim_start_hour', 6) * 3600
         cur_sec  = start_sec + step
         end_sec  = start_sec + total
@@ -1596,9 +1780,17 @@ class SubwaySimulationGUI(QMainWindow):
         self.heatmap_view.update_view(graph, densities)
         self.realtime_view.update_data(step, passenger_count, avg_density, max_queue)
 
-    def _on_finished(self):
+    def _on_finished(self, history):
+        """仿真结束：停止UI定时器，加载轨迹回放数据"""
+        self.ui_timer.stop()
         self._set_stopped_state()
         self.status_bar.showMessage("仿真完成")
+        # 加载轨迹回放到回放视图
+        if history:
+            graph = self.simulation.station_graph.get_graph() if self.simulation else None
+            if graph:
+                self.trajectory_view.set_graph(graph)
+            self.trajectory_view.set_history(history)
         self._generate_report()
 
     def _generate_report(self):
