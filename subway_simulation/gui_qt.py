@@ -5,7 +5,7 @@ from PyQt5.QtWidgets import (
     QTableWidget, QTableWidgetItem, QGridLayout, QGraphicsScene,
     QGraphicsView, QGraphicsEllipseItem, QGraphicsLineItem, QDialog,
     QFormLayout, QDoubleSpinBox, QSpinBox, QMessageBox, QGraphicsTextItem,
-    QScrollArea, QDialogButtonBox
+    QScrollArea, QDialogButtonBox, QSlider
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QPointF, QRectF
 from PyQt5.QtGui import QFont, QColor, QPainter, QPen, QBrush, QCursor, QIcon
