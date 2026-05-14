@@ -1,0 +1,31 @@
+# 排除指定文档和目录（不提交到远程仓库）
+答辩PPT/
+课程设计报告/
+数据结构与算法分析.md
+
+# IDE / 编辑器配置
+.trae/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 运行时自动生成的可视化图片
+*.png
+!icon.png
+
+# 旧版本归档
+*.zip
+SubwaySimulation v1.1/
+
+# 环境
+.env
+.venv
+venv/

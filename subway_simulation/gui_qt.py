@@ -5,7 +5,7 @@ from PyQt5.QtWidgets import (
     QTableWidget, QTableWidgetItem, QGridLayout, QGraphicsScene,
     QGraphicsView, QGraphicsEllipseItem, QGraphicsLineItem, QDialog,
     QFormLayout, QDoubleSpinBox, QSpinBox, QMessageBox, QGraphicsTextItem,
-    QScrollArea
+    QScrollArea, QDialogButtonBox
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QPointF, QRectF
 from PyQt5.QtGui import QFont, QColor, QPainter, QPen, QBrush, QCursor, QIcon
@@ -56,19 +56,20 @@ class SimulationThread(QThread):
     update_signal = pyqtSignal(int, int, dict, float, int)
     finished_signal = pyqtSignal()
 
-    def __init__(self, simulation, steps):
+    def __init__(self, simulation, steps, update_interval=5):
         super().__init__()
         self.simulation = simulation
         self.steps = steps
         self.running = True
         self.paused = False
+        self.update_interval = update_interval  # 每N步更新一次UI
 
     def run(self):
         for i in range(self.steps):
             if not self.running:
                 break
             while self.paused:
-                time.sleep(0.1)
+                time.sleep(0.05)
                 if not self.running:
                     break
             if not self.running:
@@ -76,7 +77,7 @@ class SimulationThread(QThread):
 
             self.simulation.run_simulation_step()
 
-            if (i + 1) % 10 == 0:
+            if (i + 1) % self.update_interval == 0 or i == self.steps - 1:
                 passenger_count = len(self.simulation.simulation.get_passengers())
                 densities = {}
                 total_density = 0
@@ -100,7 +101,7 @@ class SimulationThread(QThread):
 
                 self.update_signal.emit(i + 1, passenger_count, densities, avg_density, max_queue)
 
-            time.sleep(0.1)
+            time.sleep(0.02)  # 更快响应
 
         self.finished_signal.emit()
 
@@ -123,7 +124,7 @@ class NodeItem(QGraphicsEllipseItem):
     NODE_RADIUS = 12  # 节点半径，统一管理
 
     def __init__(self, node_id, node_type, x, y,
-                 capacity=50, area=100.0, base_speed=1.0, parent=None):
+                 capacity=50, area=100.0, base_speed=1.0, floor=0, parent=None):
         r = NodeItem.NODE_RADIUS
         super().__init__(-r, -r, r * 2, r * 2, parent)
         self.node_id    = node_id
@@ -132,9 +133,10 @@ class NodeItem(QGraphicsEllipseItem):
         self.capacity   = capacity
         self.area       = area
         self.base_speed = base_speed
+        self.floor      = floor
         self.setPos(x, y)
         self.setBrush(self._get_brush())
-        self.setPen(QPen(QColor('black'), 2))
+        self._apply_floor_style()
 
         # 关键：开启位置变化通知，itemChange 才会触发
         self.setFlag(QGraphicsEllipseItem.ItemIsMovable, True)
@@ -151,8 +153,15 @@ class NodeItem(QGraphicsEllipseItem):
         self.count_text.setPos(-r, r + 2)
         self.count_text.setDefaultTextColor(QColor('#333333'))
 
+        # 楼层标签（右下方）
+        self.floor_text = QGraphicsTextItem(self._floor_label(), self)
+        self.floor_text.setPos(r - 8, r - 10)
+        self.floor_text.setDefaultTextColor(QColor('#555555'))
+        font = QFont("Arial", 7)
+        font.setBold(True)
+        self.floor_text.setFont(font)
+
         # 拥堵高亮边框
-        self._base_pen = QPen(QColor('black'), 2)
         self._congestion_pen = QPen(QColor('red'), 3)
 
     # 颜色
@@ -167,6 +176,30 @@ class NodeItem(QGraphicsEllipseItem):
         'stairs':    '#795548',
         'escalator': '#f48fb1',
     }
+
+    def _floor_label(self):
+        if self.floor < 0:
+            return f"B{abs(self.floor)}"
+        elif self.floor > 0:
+            return f"F{self.floor}"
+        else:
+            return "F0"
+
+    def _apply_floor_style(self):
+        """根据楼层设置边框样式"""
+        if self.floor < 0:
+            # 地下层：蓝色虚线
+            self._base_pen = QPen(QColor('#2980b9'), 2, Qt.DashLine)
+        elif self.floor == 0:
+            # 地面层：黑色实线
+            self._base_pen = QPen(QColor('black'), 2, Qt.SolidLine)
+        elif self.floor == 1:
+            # 站厅层：橙色实线
+            self._base_pen = QPen(QColor('#e67e22'), 2, Qt.SolidLine)
+        else:
+            # 更高层：紫色实线
+            self._base_pen = QPen(QColor('#8e44ad'), 2, Qt.SolidLine)
+        self.setPen(self._base_pen)
 
     def _get_brush(self):
         color = self._COLOR_MAP.get(self.node_type, '#ffffff')
@@ -261,7 +294,7 @@ class NodeDialog(QDialog):
         self.existing_ids = existing_ids or set()
         self._original_id = node_data.get('id', '') if node_data else ''
         self.setWindowTitle("节点属性")
-        self.setFixedSize(340, 295)
+        self.setFixedSize(340, 340)
 
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
 
@@ -277,7 +310,6 @@ class NodeDialog(QDialog):
         # 节点ID
         self.id_edit = QLineEdit()
         self.id_edit.setFont(_text_font)
-        #self.id_edit.setPlaceholderText("例如: entrance3")
         layout.addRow("节点 ID:", self.id_edit)
 
         # 节点类型
@@ -285,6 +317,14 @@ class NodeDialog(QDialog):
         self.type_combo.setFont(_text_font)
         self.type_combo.addItems(self.NODE_TYPES)
         layout.addRow("节点类型:", self.type_combo)
+
+        # 楼层
+        self.floor_spin = QSpinBox()
+        self.floor_spin.setFont(_num_font)
+        self.floor_spin.setRange(-5, 10)
+        self.floor_spin.setValue(0)
+        self.floor_spin.setPrefix("F")
+        layout.addRow("楼层:", self.floor_spin)
 
         # 容量
         self.capacity_spin = QSpinBox()
@@ -333,6 +373,7 @@ class NodeDialog(QDialog):
             self.capacity_spin.setValue(node_data.get('capacity', 50))
             self.area_spin.setValue(node_data.get('area', 100.0))
             self.speed_spin.setValue(node_data.get('base_speed', 1.0))
+            self.floor_spin.setValue(node_data.get('floor', 0))
 
     def _on_accept(self):
         """校验后接受"""
@@ -350,6 +391,7 @@ class NodeDialog(QDialog):
         return {
             'id':         self.id_edit.text().strip(),
             'type':       self.type_combo.currentText(),
+            'floor':      self.floor_spin.value(),
             'capacity':   self.capacity_spin.value(),
             'area':       self.area_spin.value(),
             'base_speed': self.speed_spin.value(),
@@ -589,7 +631,8 @@ class TopologyView(QWidget):
                 item = NodeItem(node_id, data['type'], scene_x, scene_y,
                                 capacity=data['capacity'],
                                 area=data['area'],
-                                base_speed=data['base_speed'])
+                                base_speed=data['base_speed'],
+                                floor=data.get('floor', 0))
                 self.scene.addItem(item)
                 self.node_items[node_id] = item
 
@@ -710,6 +753,7 @@ class TopologyView(QWidget):
         node_data = {
             'id':         item.node_id,
             'type':       item.node_type,
+            'floor':      item.floor,
             'capacity':   item.capacity,
             'area':       item.area,
             'base_speed': item.base_speed,
@@ -719,11 +763,17 @@ class TopologyView(QWidget):
             new_data = dialog.get_data()
             new_id   = new_data['id']
             new_type = new_data['type']
-
+            new_floor = new_data.get('floor', 0)
 
             item.capacity   = new_data['capacity']
             item.area       = new_data['area']
             item.base_speed = new_data['base_speed']
+
+            # 更新楼层（如果变更）
+            if new_floor != item.floor:
+                item.floor = new_floor
+                item._apply_floor_style()
+                item.floor_text.setPlainText(item._floor_label())
 
             # 更新ID（如果变更）
             if new_id != item.node_id:
@@ -783,6 +833,7 @@ class TopologyView(QWidget):
             graph.add_node(
                 node_id, item.node_type, item.capacity,
                 pos.x(), pos.y(),
+                floor=item.floor,
                 area=item.area, base_speed=item.base_speed
             )
         for (f, t), item in self.edge_items.items():
@@ -812,8 +863,8 @@ class TopologyView(QWidget):
         }
         y_step = 120
 
-        def add(nid, ntype, x, y):
-            item = NodeItem(nid, ntype, x, y)
+        def add(nid, ntype, x, y, floor=0):
+            item = NodeItem(nid, ntype, x, y, floor=floor)
             self.scene.addItem(item)
             self.node_items[nid] = item
 
@@ -827,17 +878,20 @@ class TopologyView(QWidget):
 
         for i in range(1, n + 1):
             dy = (i - 1) * y_step
-            add(f'entrance{i}',  'entrance',  layout['entrance'][0],  layout['entrance'][1]  + dy)
-            add(f'ticket{i}',    'ticket',    layout['ticket'][0],    layout['ticket'][1]    + dy)
-            add(f'security{i}',  'security',  layout['security'][0],  layout['security'][1]  + dy)
-            add(f'gate{i}',      'gate',      layout['gate'][0],      layout['gate'][1]      + dy)
-            add(f'stairs{i}',    'stairs',    layout['stairs'][0],    layout['stairs'][1]    + dy)
-            add(f'escalator{i}', 'escalator', layout['escalator'][0], layout['escalator'][1] + dy)
-            add(f'platform{i}',  'platform',  layout['platform'][0],  layout['platform'][1]  + dy)
-            add(f'exit{i}',      'exit',      layout['exit'][0],      layout['exit'][1]      + dy)
+            # 地面层 floor=0
+            add(f'entrance{i}',  'entrance',  layout['entrance'][0],  layout['entrance'][1]  + dy, floor=0)
+            add(f'exit{i}',      'exit',      layout['exit'][0],      layout['exit'][1]      + dy, floor=0)
+            # 站厅层 floor=1
+            add(f'ticket{i}',    'ticket',    layout['ticket'][0],    layout['ticket'][1]    + dy, floor=1)
+            add(f'security{i}',  'security',  layout['security'][0],  layout['security'][1]  + dy, floor=1)
+            add(f'gate{i}',      'gate',      layout['gate'][0],      layout['gate'][1]      + dy, floor=1)
+            # 站台层 floor=-1
+            add(f'stairs{i}',    'stairs',    layout['stairs'][0],    layout['stairs'][1]    + dy, floor=-1)
+            add(f'escalator{i}', 'escalator', layout['escalator'][0], layout['escalator'][1] + dy, floor=-1)
+            add(f'platform{i}',  'platform',  layout['platform'][0],  layout['platform'][1]  + dy, floor=-1)
 
-        # 通道（汇聚点，只加一个）
-        add('corridor1', 'corridor', layout['corridor'][0], layout['corridor'][1])
+        # 通道（汇聚点，站厅层）
+        add('corridor1', 'corridor', layout['corridor'][0], layout['corridor'][1], floor=1)
 
         # 连接
         for i in range(1, n + 1):
@@ -1154,6 +1208,16 @@ class AnalyticsView(QWidget):
                 "",
             ]
 
+        fs = report.get('finished_stats')
+        if fs:
+            lines += [
+                "【已完成乘客】",
+                f"  总人数       : {fs.get('finished_count', 0)}",
+                f"  平均等待时间 : {fs.get('avg_wait_time', 0):.1f} 秒",
+                f"  平均通行时间 : {fs.get('avg_travel_time', 0):.1f} 秒",
+                "",
+            ]
+
         ds = report.get('density_stats')
         if ds:
             lines += [
@@ -1166,11 +1230,18 @@ class AnalyticsView(QWidget):
 
         bn = report.get('bottlenecks', [])
         if bn:
-            lines += ["【瓶颈节点】", f"  {bn}", ""]
+            lines += ["【瓶颈节点 Top5】"]
+            for b in bn[:5]:
+                lines.append(f"  {b['node_id']}: 平均密度={b['avg_density']}, "
+                           f"高密度占比={b['high_density_ratio']*100:.1f}%")
+            lines.append("")
 
         top = report.get('top_congested_nodes', [])
         if top:
-            lines += ["【最拥堵 Top5】", f"  {top}", ""]
+            lines += ["【最拥堵 Top5】"]
+            for t in top[:5]:
+                lines.append(f"  {t['node_id']}: {t['avg_density']}")
+            lines.append("")
 
         vc = report.get('visit_counts', {})
         if vc:
@@ -1193,6 +1264,7 @@ class SubwaySimulation:
                  period_rules=None, start_hour=6):
         self.station_size   = station_size
         self.operation_time = operation_time
+        self.total_steps    = total_steps
 
         self.peak_hours = [(0, total_steps)]
 
@@ -1220,32 +1292,47 @@ class SubwaySimulation:
             "小型站": dict(ec=30, tc=20, sc=15, gc=10, cc=80,  pc=150, xc=30, n=1),
             "中型站": dict(ec=50, tc=30, sc=20, gc=15, cc=100, pc=200, xc=50, n=2),
             "大型站": dict(ec=80, tc=50, sc=30, gc=25, cc=150, pc=300, xc=80, n=3),
+            "换乘站": dict(ec=100, tc=60, sc=40, gc=30, cc=200, pc=400, xc=100, n=4),
         }
         c = cfg.get(self.station_size, cfg["中型站"])
         n = c['n']
 
+        # 多楼层：floor=0 地面层，floor=1 站厅层，floor=-1 站台层
         for i in range(1, n + 1):
-            graph.add_node(f'entrance{i}',  'entrance',  c['ec'], 0,  5*i, area=100.0, base_speed=1.0)
-            graph.add_node(f'ticket{i}',    'ticket',    c['tc'], 5,  5*i, area=80.0,  base_speed=0.8)
-            graph.add_node(f'security{i}',  'security',  c['sc'], 10, 5*i, area=60.0,  base_speed=0.6)
-            graph.add_node(f'gate{i}',      'gate',      c['gc'], 15, 5*i, area=40.0,  base_speed=1.0)
-            graph.add_node(f'stairs{i}',    'stairs',    10,      25, 5*i, area=30.0,  base_speed=0.5)
-            graph.add_node(f'escalator{i}', 'escalator', 20,      25, 5*i+2.5, area=50.0, base_speed=0.8)
-            graph.add_node(f'platform{i}',  'platform',  c['pc'], 30, 5*i, area=400.0, base_speed=1.0)
-            graph.add_node(f'exit{i}',      'exit',      c['xc'], 35, 5*i, area=100.0, base_speed=1.0)
+            y_offset = (i - 1) * 80
+            # 地面层
+            graph.add_node(f'entrance{i}',  'entrance',  c['ec'], 0,  10 + y_offset,
+                           floor=0, area=120.0, base_speed=1.2)
+            graph.add_node(f'exit{i}',      'exit',      c['xc'], 600, 10 + y_offset,
+                           floor=0, area=100.0, base_speed=1.2)
+            # 站厅层
+            graph.add_node(f'ticket{i}',    'ticket',    c['tc'], 80, 10 + y_offset,
+                           floor=1, area=80.0, base_speed=0.8, service_rate=0.4)
+            graph.add_node(f'security{i}',  'security',  c['sc'], 160, 10 + y_offset,
+                           floor=1, area=60.0, base_speed=0.6, service_rate=0.25)
+            graph.add_node(f'gate{i}',      'gate',      c['gc'], 240, 10 + y_offset,
+                           floor=1, area=40.0, base_speed=1.0, service_rate=0.6)
+            # 站台层
+            graph.add_node(f'stairs{i}',    'stairs',    10,      400, 10 + y_offset,
+                           floor=-1, area=30.0, base_speed=0.5)
+            graph.add_node(f'escalator{i}', 'escalator', 20,      400, 30 + y_offset,
+                           floor=-1, area=50.0, base_speed=0.8)
+            graph.add_node(f'platform{i}',  'platform',  c['pc'], 500, 20 + y_offset,
+                           floor=-1, area=400.0, base_speed=1.0, dwell_time=30)
 
-        graph.add_node('corridor1', 'corridor', c['cc'], 20, 10, area=200.0, base_speed=1.2)
+        graph.add_node('corridor1', 'corridor', c['cc'], 320, 40 + (n-1)*40,
+                       floor=1, area=300.0, base_speed=1.2)
 
         for i in range(1, n + 1):
-            graph.add_edge(f'entrance{i}',  f'ticket{i}',    5, 2, capacity=10, base_time=1.0)
-            graph.add_edge(f'ticket{i}',    f'security{i}',  5, 2, capacity=8,  base_time=1.0)
-            graph.add_edge(f'security{i}',  f'gate{i}',      5, 2, capacity=5,  base_time=1.0)
-            graph.add_edge(f'gate{i}',      'corridor1',     5, 3, capacity=15, base_time=1.0)
-            graph.add_edge('corridor1',     f'stairs{i}',    5, 2, capacity=8,  base_time=1.0)
-            graph.add_edge('corridor1',     f'escalator{i}', 5, 3, capacity=12, base_time=1.0)
-            graph.add_edge(f'stairs{i}',    f'platform{i}',  10, 2, capacity=6, base_time=2.0)
-            graph.add_edge(f'escalator{i}', f'platform{i}',  10, 3, capacity=10, base_time=1.5)
-            graph.add_edge(f'platform{i}',  f'exit{i}',      5, 2, capacity=10, base_time=1.0)
+            graph.add_edge(f'entrance{i}',  f'ticket{i}',    20, 3, capacity=15, base_time=2.0)
+            graph.add_edge(f'ticket{i}',    f'security{i}',  20, 3, capacity=10, base_time=2.0)
+            graph.add_edge(f'security{i}',  f'gate{i}',      15, 3, capacity=8,  base_time=1.5)
+            graph.add_edge(f'gate{i}',      'corridor1',     25, 4, capacity=20, base_time=3.0)
+            graph.add_edge('corridor1',     f'stairs{i}',    30, 3, capacity=8,  base_time=4.0)
+            graph.add_edge('corridor1',     f'escalator{i}', 30, 4, capacity=12, base_time=3.0)
+            graph.add_edge(f'stairs{i}',    f'platform{i}',  40, 2, capacity=6,  base_time=8.0)
+            graph.add_edge(f'escalator{i}', f'platform{i}',  40, 3, capacity=10, base_time=5.0)
+            graph.add_edge(f'platform{i}',  f'exit{i}',      30, 3, capacity=15, base_time=3.0)
 
         return graph
 
@@ -1259,7 +1346,12 @@ class SubwaySimulation:
             for node in self.station_graph.get_graph().nodes()
         }
         self.analytics.record_data(self.simulation.get_current_time(), passengers, densities)
-        return self.analytics.generate_report()
+        report = self.analytics.generate_report()
+        # 合并已完成乘客统计
+        finished = self.simulation.get_finished_stats()
+        if finished:
+            report['finished_stats'] = finished
+        return report
 
 
 ##  主窗口
@@ -1334,7 +1426,7 @@ class SubwaySimulationGUI(QMainWindow):
         self.path_mode_combo = QComboBox()
         self.path_mode_combo.addItems(["最短时间", "最短距离", "多目标优化", "最少区域切换"])
         self.station_size_combo = QComboBox()
-        self.station_size_combo.addItems(["小型站", "中型站", "大型站"])
+        self.station_size_combo.addItems(["小型站", "中型站", "大型站", "换乘站"])
         self.start_hour_combo = QComboBox()
         self.start_hour_combo.addItems([f"{h:02d}:00" for h in range(6, 24)])
         self.start_hour_combo.setCurrentIndex(0)   # 默认 06:00
